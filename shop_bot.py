@@ -1,394 +1,216 @@
-﻿import asyncio
+import os
+import re
+import asyncio
 import logging
-import json
-from typing import List, Tuple, Optional, Dict
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    InputMediaPhoto, InputMediaVideo
+)
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
 import aiosqlite
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.enums import ChatType, ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
-from aiogram.client.default import DefaultBotProperties
+from dotenv import load_dotenv
 
-# =========================
-# CONFIG
-# =========================
-BOT_TOKEN = "8512928119:AAFCNGuCvwhKs48JUeAnUMTl7N1uisu3qF8"
-OWNER_ID = 1831731188  # <-- С‚РІРѕР№ Telegram user_id
-DB_PATH = "/data/shop.db"
+# -------------------- CONFIG --------------------
+load_dotenv()  # локально .env, на Fly просто игнорируется
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+DB_PATH = os.getenv("DB_PATH", "/data/shop.db").strip()  # для Fly правильно так
+
+if not BOT_TOKEN:
+    raise SystemExit("❌ BOT_TOKEN пуст. На Fly: flyctl secrets set BOT_TOKEN=...")
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("shop_bot")
+log = logging.getLogger("shop_bot")
 
 bot = Bot(
-    BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
+
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-BOT_USERNAME: Optional[str] = None  # Р·Р°РїРѕР»РЅРёРј РїСЂРё СЃС‚Р°СЂС‚Рµ
+
+# -------------------- DB HELPERS --------------------
+async def db() -> aiosqlite.Connection:
+    conn = await aiosqlite.connect(DB_PATH)
+    await conn.execute("PRAGMA foreign_keys = ON;")
+    conn.row_factory = aiosqlite.Row
+    return conn
 
 
-# =========================
-# DB
-# =========================
-DEFAULT_SETTINGS: Dict[str, str] = {
-    "start_text": "РџСЂРёРІРµС‚! РќР°Р¶РјРё РєРЅРѕРїРєСѓ Рё РѕС‚РєСЂРѕР№ РјР°РіР°Р·РёРЅ:",
-    "support_text": "рџ† РџРѕРґРґРµСЂР¶РєР°\nРќР°РїРёС€РёС‚Рµ РјРµРЅРµРґР¶РµСЂСѓ: @your_manager_username",
-    "group_welcome_text": "рџ‘‹ Р”РѕР±СЂРѕ РїРѕР¶Р°Р»РѕРІР°С‚СЊ! РҐРѕС‚РёС‚Рµ РїРѕСЃРјРѕС‚СЂРµС‚СЊ С‚РѕРІР°СЂС‹?\nРќР°Р¶РјРёС‚Рµ РєРЅРѕРїРєСѓ рџ‘‡",
-    "group_welcome_button": "рџ›Ќ РћС‚РєСЂС‹С‚СЊ РјР°РіР°Р·РёРЅ",
+DEFAULT_TEXTS: Dict[str, str] = {
+    # Пользовательские тексты
+    "start_text": (
+        "👋 Привет!\n\n"
+        "Здесь ты можешь выбрать категорию и купить товар.\n"
+        "Если нужна помощь — нажми <b>Поддержка</b>."
+    ),
+    "support_text": "🆘 Поддержка\nНапишите менеджеру: @your_manager_username",
+    "group_welcome_text": (
+        "👋 Добро пожаловать!\n"
+        "Чтобы открыть магазин — нажмите кнопку ниже 👇"
+    ),
+    "group_welcome_button": "🛒 Открыть магазин",
+
+    # Заголовки/подсказки
+    "choose_category": "📦 Выберите категорию:",
+    "choose_subcategory": "📁 Выберите подкатегорию:",
+    "choose_product": "🛍️ Выберите товар:",
+    "no_items": "Пока ничего нет 🙃",
+    "buy_btn": "✅ Купить",
+    "back_btn": "⬅️ Назад",
+    "home_btn": "🏠 В меню",
+    "admin_btn": "⚙️ Админ панель",
 }
 
-async def db_init():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
+ROLE_OWNER = "owner"
+ROLE_ADMIN = "admin"
+ROLE_MOD = "mod"
+ROLE_USER = "user"
 
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            role TEXT NOT NULL DEFAULT 'user' -- user/mod/admin/owner
-        );
-        """)
 
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
+async def init_db():
+    conn = await db()
+    try:
+        await conn.executescript("""
+        CREATE TABLE IF NOT EXISTS settings(
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-        """)
 
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS categories (
+        CREATE TABLE IF NOT EXISTS staff(
+            user_id INTEGER PRIMARY KEY,
+            role TEXT NOT NULL CHECK(role IN ('owner','admin','mod'))
+        );
+
+        CREATE TABLE IF NOT EXISTS categories(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            pos INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS subcategories(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            pos INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS products(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subcategory_id INTEGER NOT NULL REFERENCES subcategories(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            price TEXT DEFAULT '',
+            media_type TEXT DEFAULT '',   -- 'photo'/'video'/''
+            media_file_id TEXT DEFAULT '',
+            pos INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS buy_methods(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
             title TEXT NOT NULL,
-            sort INTEGER NOT NULL DEFAULT 0
+            url TEXT NOT NULL,
+            pos INTEGER NOT NULL DEFAULT 0
         );
         """)
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS subcategories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            sort INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE CASCADE
-        );
-        """)
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subcategory_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            price TEXT NOT NULL DEFAULT '',
-            description TEXT NOT NULL DEFAULT '',
-            media_type TEXT NOT NULL DEFAULT '',    -- photo/video/''
-            media_file_id TEXT NOT NULL DEFAULT '', -- telegram file_id
-            is_active INTEGER NOT NULL DEFAULT 1,
-            sort INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY(subcategory_id) REFERENCES subcategories(id) ON DELETE CASCADE
-        );
-        """)
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS purchase_methods (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER NOT NULL UNIQUE,     -- РѕРґРёРЅ РјРµС‚РѕРґ РЅР° С‚РѕРІР°СЂ (MVP)
-            method_type TEXT NOT NULL,              -- link/manager/text
-            payload TEXT NOT NULL,                  -- json
-            button_text TEXT NOT NULL DEFAULT 'РљСѓРїРёС‚СЊ',
-            FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
-        );
-        """)
-
-        # РіР°СЂР°РЅС‚РёСЂСѓРµРј owner
-        await db.execute("""
-        INSERT INTO users(user_id, role) VALUES(?, 'owner')
-        ON CONFLICT(user_id) DO UPDATE SET role='owner';
-        """, (OWNER_ID,))
-
-        # РґРµС„РѕР»С‚РЅС‹Рµ РЅР°СЃС‚СЂРѕР№РєРё (С‚РѕР»СЊРєРѕ РµСЃР»Рё РєР»СЋС‡Р° РЅРµС‚)
-        for k, v in DEFAULT_SETTINGS.items():
-            await db.execute("""
-            INSERT INTO settings(key, value) VALUES(?, ?)
-            ON CONFLICT(key) DO NOTHING;
-            """, (k, v))
-
-        await db.commit()
-
-
-async def db_get_setting(key: str) -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        async with db.execute("SELECT value FROM settings WHERE key=?", (key,)) as cur:
-            row = await cur.fetchone()
-            if row:
-                return row[0]
-    return DEFAULT_SETTINGS.get(key, "")
-
-
-async def db_set_setting(key: str, value: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        await db.execute("""
-        INSERT INTO settings(key, value) VALUES(?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-        """, (key, value))
-        await db.commit()
-
-
-async def db_get_role(user_id: int) -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        async with db.execute("SELECT role FROM users WHERE user_id=?", (user_id,)) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else "user"
-
-
-async def db_set_role(user_id: int, role: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        await db.execute("""
-        INSERT INTO users(user_id, role) VALUES(?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET role=excluded.role
-        """, (user_id, role))
-        await db.commit()
-
-
-async def db_list_staff() -> List[Tuple[int, str]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        async with db.execute("""
-            SELECT user_id, role FROM users
-            WHERE role IN ('owner','admin','mod')
-            ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'mod' THEN 2 ELSE 3 END, user_id
-        """) as cur:
-            return await cur.fetchall()
-
-
-def role_rank(role: str) -> int:
-    return {"user": 0, "mod": 1, "admin": 2, "owner": 3}.get(role, 0)
-
-
-async def require_min_role(user_id: int, min_role: str) -> bool:
-    r = await db_get_role(user_id)
-    return role_rank(r) >= role_rank(min_role)
-
-
-# ---------- Catalog queries ----------
-async def db_get_categories():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        async with db.execute("SELECT id, title FROM categories ORDER BY sort, id") as cur:
-            return await cur.fetchall()
-
-
-async def db_get_category(category_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        async with db.execute("SELECT id, title FROM categories WHERE id=?", (category_id,)) as cur:
-            return await cur.fetchone()
-
-
-async def db_rename_category(category_id: int, title: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        await db.execute("UPDATE categories SET title=? WHERE id=?", (title, category_id))
-        await db.commit()
-
-
-async def db_delete_category(category_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        await db.execute("DELETE FROM categories WHERE id=?", (category_id,))
-        await db.commit()
-
-
-async def db_get_subcategories(category_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        async with db.execute(
-            "SELECT id, title FROM subcategories WHERE category_id=? ORDER BY sort, id",
-            (category_id,),
-        ) as cur:
-            return await cur.fetchall()
-
-
-async def db_get_subcategory(subcategory_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        async with db.execute("SELECT id, category_id, title FROM subcategories WHERE id=?", (subcategory_id,)) as cur:
-            return await cur.fetchone()
-
-
-async def db_rename_subcategory(subcategory_id: int, title: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        await db.execute("UPDATE subcategories SET title=? WHERE id=?", (title, subcategory_id))
-        await db.commit()
-
-
-async def db_delete_subcategory(subcategory_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        await db.execute("DELETE FROM subcategories WHERE id=?", (subcategory_id,))
-        await db.commit()
-
-
-async def db_get_products(subcategory_id: int, include_inactive: bool = False):
-    q = "SELECT id, title, price, is_active FROM products WHERE subcategory_id=?"
-    params = [subcategory_id]
-    if not include_inactive:
-        q += " AND is_active=1"
-    q += " ORDER BY sort, id"
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        async with db.execute(q, tuple(params)) as cur:
-            return await cur.fetchall()
-
-
-async def db_get_product(product_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        async with db.execute("""
-            SELECT id, subcategory_id, title, price, description, media_type, media_file_id, is_active
-            FROM products WHERE id=?
-        """, (product_id,)) as cur:
-            return await cur.fetchone()
-
-
-async def db_update_product_fields(product_id: int, **fields):
-    # fields: title, price, description, media_type, media_file_id, is_active
-    if not fields:
-        return
-    keys = []
-    vals = []
-    for k, v in fields.items():
-        keys.append(f"{k}=?")
-        vals.append(v)
-    vals.append(product_id)
-    q = f"UPDATE products SET {', '.join(keys)} WHERE id=?"
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        await db.execute(q, tuple(vals))
-        await db.commit()
-
-
-async def db_delete_product(product_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        await db.execute("DELETE FROM products WHERE id=?", (product_id,))
-        await db.commit()
-
-
-async def db_get_purchase_method(product_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        async with db.execute("""
-            SELECT method_type, payload, button_text
-            FROM purchase_methods WHERE product_id=?
-        """, (product_id,)) as cur:
-            return await cur.fetchone()
-
-
-async def db_upsert_purchase_method(product_id: int, method_type: str, payload: dict, button_text: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        await db.execute("""
-            INSERT INTO purchase_methods(product_id, method_type, payload, button_text)
-            VALUES(?, ?, ?, ?)
-            ON CONFLICT(product_id) DO UPDATE SET
-                method_type=excluded.method_type,
-                payload=excluded.payload,
-                button_text=excluded.button_text
-        """, (product_id, method_type, json.dumps(payload, ensure_ascii=False), button_text))
-        await db.commit()
-
-
-async def db_add_category(title: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        await db.execute("INSERT INTO categories(title) VALUES(?)", (title,))
-        await db.commit()
-
-
-async def db_add_subcategory(category_id: int, title: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        await db.execute("INSERT INTO subcategories(category_id, title) VALUES(?, ?)", (category_id, title))
-        await db.commit()
-
-
-async def db_add_product(subcategory_id: int, title: str, price: str, description: str,
-                         media_type: str, media_file_id: str) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        cur = await db.execute("""
-            INSERT INTO products(subcategory_id, title, price, description, media_type, media_file_id)
-            VALUES(?, ?, ?, ?, ?, ?)
-        """, (subcategory_id, title, price, description, media_type, media_file_id))
-        await db.commit()
-        return cur.lastrowid
-
-
-async def db_toggle_product_active(product_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA foreign_keys = ON;")
-        await db.execute("""
-            UPDATE products
-            SET is_active = CASE WHEN is_active=1 THEN 0 ELSE 1 END
-            WHERE id=?
-        """, (product_id,))
-        await db.commit()
-
-
-# =========================
-# UI helpers
-# =========================
-def make_open_shop_kb(button_text: str) -> InlineKeyboardMarkup:
-    if BOT_USERNAME:
-        url = f"https://t.me/{BOT_USERNAME}?start=shop"
-    else:
-        url = "https://t.me/"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=button_text, url=url)]
-    ])
-
-
-def kb_main() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="рџ›Ќ РљР°С‚Р°Р»РѕРі", callback_data="catalog")],
-        [InlineKeyboardButton(text="рџ† РџРѕРґРґРµСЂР¶РєР°", callback_data="support")],
-    ])
-
-
-def kb_back(cb: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data=cb)]
-    ])
-
-
-def kb_admin_panel(is_owner: bool) -> InlineKeyboardMarkup:
+        await conn.commit()
+
+        # settings defaults
+        for k, v in DEFAULT_TEXTS.items():
+            await conn.execute(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES(?,?)",
+                (k, v)
+            )
+        await conn.commit()
+
+        # owner default
+        if OWNER_ID:
+            await conn.execute(
+                "INSERT OR IGNORE INTO staff(user_id, role) VALUES(?,?)",
+                (OWNER_ID, ROLE_OWNER)
+            )
+            await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def get_setting(key: str) -> str:
+    conn = await db()
+    try:
+        cur = await conn.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = await cur.fetchone()
+        return row["value"] if row else DEFAULT_TEXTS.get(key, "")
+    finally:
+        await conn.close()
+
+
+async def set_setting(key: str, value: str):
+    conn = await db()
+    try:
+        await conn.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value)
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def get_staff_role(user_id: int) -> str:
+    if OWNER_ID and user_id == OWNER_ID:
+        return ROLE_OWNER
+    conn = await db()
+    try:
+        cur = await conn.execute("SELECT role FROM staff WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        return row["role"] if row else ROLE_USER
+    finally:
+        await conn.close()
+
+
+def role_at_least(role: str, min_role: str) -> bool:
+    order = {ROLE_USER: 0, ROLE_MOD: 1, ROLE_ADMIN: 2, ROLE_OWNER: 3}
+    return order.get(role, 0) >= order.get(min_role, 0)
+
+
+# -------------------- UI HELPERS --------------------
+def kb_home(is_admin: bool) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="вћ• Р”РѕР±Р°РІРёС‚СЊ РєР°С‚РµРіРѕСЂРёСЋ", callback_data="adm_add_cat")],
-        [InlineKeyboardButton(text="вћ• Р”РѕР±Р°РІРёС‚СЊ РїРѕРґРєР°С‚РµРіРѕСЂРёСЋ", callback_data="adm_add_sub")],
-        [InlineKeyboardButton(text="вћ• Р”РѕР±Р°РІРёС‚СЊ С‚РѕРІР°СЂ", callback_data="adm_add_product")],
-        [InlineKeyboardButton(text="вњЏпёЏ Р РµРґР°РєС‚РёСЂРѕРІР°РЅРёРµ РєР°С‚Р°Р»РѕРіР°", callback_data="adm_edit_catalog")],
-        [InlineKeyboardButton(text="рџ“ќ РўРµРєСЃС‚С‹ (РїСЂРёРІРµС‚СЃС‚РІРёРµ/РїРѕРґРґРµСЂР¶РєР°)", callback_data="adm_texts")],
+        [InlineKeyboardButton(text="🛍️ Открыть магазин", callback_data="shop:home")],
+        [InlineKeyboardButton(text="🆘 Поддержка", callback_data="support")]
     ]
-    if is_owner:
-        rows.append([InlineKeyboardButton(text="рџ‘‘ Р РѕР»Рё (admin/mod)", callback_data="adm_roles")])
-    rows.append([InlineKeyboardButton(text="в¬…пёЏ Р’ РјРµРЅСЋ", callback_data="home")])
+    if is_admin:
+        rows.append([InlineKeyboardButton(text="⚙️ Админ панель", callback_data="admin:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_back(to: str = "shop:home") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=to)],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="home")]
+    ])
+
+
+def kb_only_home() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="home")]
+    ])
 
 
 async def safe_edit_text(msg: Message, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
@@ -398,49 +220,138 @@ async def safe_edit_text(msg: Message, text: str, reply_markup: Optional[InlineK
         await msg.answer(text, reply_markup=reply_markup)
 
 
-async def safe_delete(msg: Message):
+# -------------------- SHOP QUERIES --------------------
+async def list_categories() -> List[aiosqlite.Row]:
+    conn = await db()
     try:
-        await msg.delete()
-    except Exception:
-        pass
+        cur = await conn.execute("SELECT id, name FROM categories ORDER BY pos, id")
+        return await cur.fetchall()
+    finally:
+        await conn.close()
 
 
-# =========================
-# FSM states
-# =========================
-class AddCategory(StatesGroup):
-    title = State()
+async def list_subcategories(category_id: int) -> List[aiosqlite.Row]:
+    conn = await db()
+    try:
+        cur = await conn.execute(
+            "SELECT id, name FROM subcategories WHERE category_id=? ORDER BY pos, id",
+            (category_id,)
+        )
+        return await cur.fetchall()
+    finally:
+        await conn.close()
 
 
-class AddSubcategory(StatesGroup):
-    pick_category = State()
-    title = State()
+async def list_products(subcategory_id: int) -> List[aiosqlite.Row]:
+    conn = await db()
+    try:
+        cur = await conn.execute(
+            "SELECT id, name FROM products WHERE subcategory_id=? ORDER BY pos, id",
+            (subcategory_id,)
+        )
+        return await cur.fetchall()
+    finally:
+        await conn.close()
 
 
-class AddProduct(StatesGroup):
-    pick_category = State()
-    pick_subcategory = State()
-    title = State()
-    price = State()
+async def get_product(product_id: int) -> Optional[aiosqlite.Row]:
+    conn = await db()
+    try:
+        cur = await conn.execute("SELECT * FROM products WHERE id=?", (product_id,))
+        return await cur.fetchone()
+    finally:
+        await conn.close()
+
+
+async def list_buy_methods(product_id: int) -> List[aiosqlite.Row]:
+    conn = await db()
+    try:
+        cur = await conn.execute(
+            "SELECT id, title, url FROM buy_methods WHERE product_id=? ORDER BY pos, id",
+            (product_id,)
+        )
+        return await cur.fetchall()
+    finally:
+        await conn.close()
+
+
+# -------------------- ADMIN QUERIES --------------------
+async def staff_list() -> List[aiosqlite.Row]:
+    conn = await db()
+    try:
+        cur = await conn.execute("SELECT user_id, role FROM staff ORDER BY role DESC, user_id ASC")
+        return await cur.fetchall()
+    finally:
+        await conn.close()
+
+
+async def staff_set_role(user_id: int, role: str):
+    conn = await db()
+    try:
+        await conn.execute(
+            "INSERT INTO staff(user_id, role) VALUES(?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET role=excluded.role",
+            (user_id, role)
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def staff_remove(user_id: int):
+    conn = await db()
+    try:
+        await conn.execute("DELETE FROM staff WHERE user_id=?", (user_id,))
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+# -------------------- STATES --------------------
+class AdminAddCategory(StatesGroup):
+    name = State()
+
+
+class AdminEditCategory(StatesGroup):
+    category_id = State()
+    name = State()
+
+
+class AdminAddSubcategory(StatesGroup):
+    category_id = State()
+    name = State()
+
+
+class AdminEditSubcategory(StatesGroup):
+    subcategory_id = State()
+    name = State()
+
+
+class AdminAddProduct(StatesGroup):
+    subcategory_id = State()
+    name = State()
     description = State()
+    price = State()
     media = State()
-    purchase_type = State()
-    purchase_payload = State()
-    purchase_button_text = State()
 
 
-class SetBuy(StatesGroup):
+class AdminEditProduct(StatesGroup):
     product_id = State()
-    purchase_type = State()
-    purchase_payload = State()
-    purchase_button_text = State()
+    field = State()
+    value = State()
+    media = State()
 
 
-class RolesManage(StatesGroup):
-    action = State()
-    user_id = State()
-    role = State()
-    target_user_id = State()
+class AdminAddBuyMethod(StatesGroup):
+    product_id = State()
+    title = State()
+    url = State()
+
+
+class AdminEditBuyMethod(StatesGroup):
+    method_id = State()
+    title = State()
+    url = State()
 
 
 class EditTexts(StatesGroup):
@@ -448,428 +359,583 @@ class EditTexts(StatesGroup):
     value = State()
 
 
-class EditCategory(StatesGroup):
-    category_id = State()
-    new_title = State()
+class StaffAdd(StatesGroup):
+    role = State()
+    user_id = State()
 
 
-class EditSubcategory(StatesGroup):
-    subcategory_id = State()
-    new_title = State()
-
-
-class EditProduct(StatesGroup):
-    product_id = State()
-    field = State()
-    value = State()
-
-
-# =========================
-# CATALOG keyboards
-# =========================
-async def kb_categories(prefix: str = "cat") -> InlineKeyboardMarkup:
-    cats = await db_get_categories()
-    rows = []
-    for cid, title in cats:
-        rows.append([InlineKeyboardButton(text=title, callback_data=f"{prefix}:{cid}")])
-    rows.append([InlineKeyboardButton(text="в¬…пёЏ Р’ РјРµРЅСЋ", callback_data="home")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def kb_subcategories(category_id: int) -> InlineKeyboardMarkup:
-    subs = await db_get_subcategories(category_id)
-    rows = []
-    for sid, title in subs:
-        rows.append([InlineKeyboardButton(text=title, callback_data=f"sub:{category_id}:{sid}")])
-    rows.append([InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data="catalog")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def kb_products(category_id: int, subcategory_id: int, is_staff: bool) -> InlineKeyboardMarkup:
-    prods = await db_get_products(subcategory_id, include_inactive=is_staff)
-    rows = []
-    for pid, title, price, active in prods:
-        label = title
-        if price:
-            label += f" вЂ” {price}"
-        if is_staff and not active:
-            label = "в›” " + label
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"prod:{category_id}:{subcategory_id}:{pid}")])
-    rows.append([InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data=f"cat:{category_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def kb_product_view(category_id: int, subcategory_id: int, product_id: int,
-                    buy_text: str, has_buy: bool, is_mod: bool, is_admin: bool) -> InlineKeyboardMarkup:
-    rows = []
-    if has_buy:
-        rows.append([InlineKeyboardButton(text=f"вњ… {buy_text}", callback_data=f"buy:{product_id}")])
-    if is_mod:
-        rows.append([InlineKeyboardButton(text="рџ”Ѓ Р’РєР»/Р’С‹РєР»", callback_data=f"adm_toggle:{product_id}")])
-    if is_admin:
-        rows.append([InlineKeyboardButton(text="вњЏпёЏ Р РµРґР°РєС‚РёСЂРѕРІР°С‚СЊ С‚РѕРІР°СЂ", callback_data=f"adm_edit_product:{product_id}")])
-        rows.append([InlineKeyboardButton(text="рџ›’ РќР°СЃС‚СЂРѕРёС‚СЊ РїРѕРєСѓРїРєСѓ", callback_data=f"adm_setbuy:{product_id}")])
-    rows.append([InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data=f"sub:{category_id}:{subcategory_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-# =========================
-# START / MENU
-# =========================
+# -------------------- COMMANDS --------------------
 @router.message(CommandStart())
-async def start(m: Message):
-    if m.from_user:
-        uid = m.from_user.id
-        if uid == OWNER_ID:
-            await db_set_role(uid, "owner")
-        else:
-            r = await db_get_role(uid)
-            if r == "user":
-                await db_set_role(uid, "user")
-
-    arg = (m.text or "").split(maxsplit=1)
-    start_arg = arg[1] if len(arg) > 1 else ""
-
-    start_text = await db_get_setting("start_text")
-    if start_arg == "shop":
-        await m.answer("рџ›Ќ Р”РѕР±СЂРѕ РїРѕР¶Р°Р»РѕРІР°С‚СЊ РІ РјР°РіР°Р·РёРЅ! Р’С‹Р±РµСЂРёС‚Рµ СЂР°Р·РґРµР»:", reply_markup=kb_main())
-    else:
-        await m.answer(start_text, reply_markup=kb_main())
+async def cmd_start(m: Message):
+    role = await get_staff_role(m.from_user.id)
+    is_admin = role_at_least(role, ROLE_MOD)
+    text = await get_setting("start_text")
+    await m.answer(text, reply_markup=kb_home(is_admin))
 
 
-@router.message(Command("id"))
-async def cmd_id(m: Message):
-    if m.from_user:
-        await m.answer(f"Р’Р°С€ user_id: <code>{m.from_user.id}</code>")
+@router.message(Command("admin"))
+async def cmd_admin(m: Message):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await m.answer("⛔ Доступ запрещён.")
+    await m.answer("⚙️ Админ панель", reply_markup=admin_home_kb(role))
 
 
+# -------------------- GROUP WELCOME --------------------
+def open_shop_kb(btn_text: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=btn_text, url=f"https://t.me/{(bot.username or '').lstrip('@')}")]
+    ])
+
+
+@router.message(F.new_chat_members)
+async def on_new_members(m: Message):
+    # Приветствие в группе
+    welcome = await get_setting("group_welcome_text")
+    btn_text = await get_setting("group_welcome_button")
+    await m.reply(welcome, reply_markup=open_shop_kb(btn_text))
+
+
+# -------------------- MAIN HOME --------------------
 @router.callback_query(F.data == "home")
 async def cb_home(c: CallbackQuery):
-    start_text = await db_get_setting("start_text")
-    await safe_edit_text(c.message, start_text, reply_markup=kb_main())
+    role = await get_staff_role(c.from_user.id)
+    is_admin = role_at_least(role, ROLE_MOD)
+    text = await get_setting("start_text")
+    await safe_edit_text(c.message, text, reply_markup=kb_home(is_admin))
     await c.answer()
 
 
 @router.callback_query(F.data == "support")
 async def cb_support(c: CallbackQuery):
-    support_text = await db_get_setting("support_text")
-    await safe_edit_text(c.message, support_text, reply_markup=kb_back("home"))
+    text = await get_setting("support_text")
+    await safe_edit_text(c.message, text, reply_markup=kb_only_home())
     await c.answer()
 
 
-# =========================
-# GROUP WELCOME
-# =========================
-@router.message(F.new_chat_members)
-async def on_new_members(m: Message):
-    if m.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return
-
-    welcome = await db_get_setting("group_welcome_text")
-    btn_text = await db_get_setting("group_welcome_button")
-
-    for u in m.new_chat_members:
-        if u.is_bot:
-            continue
-        await m.reply(welcome, reply_markup=make_open_shop_kb(btn_text))
-
-
-# =========================
-# SHOP FLOW
-# =========================
-@router.callback_query(F.data == "catalog")
-async def cb_catalog(c: CallbackQuery):
-    kb = await kb_categories(prefix="cat")
-    await safe_edit_text(c.message, "рџ—‚ Р’С‹Р±РµСЂРёС‚Рµ РєР°С‚РµРіРѕСЂРёСЋ:", reply_markup=kb)
+# -------------------- SHOP FLOW --------------------
+@router.callback_query(F.data == "shop:home")
+async def shop_home(c: CallbackQuery):
+    cats = await list_categories()
+    if not cats:
+        await safe_edit_text(c.message, await get_setting("no_items"), reply_markup=kb_only_home())
+        return await c.answer()
+    rows = []
+    for r in cats:
+        rows.append([InlineKeyboardButton(text=r["name"], callback_data=f"shop:cat:{r['id']}")])
+    rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await safe_edit_text(c.message, await get_setting("choose_category"), reply_markup=kb)
     await c.answer()
 
 
-@router.callback_query(F.data.startswith("cat:"))
-async def cb_category(c: CallbackQuery):
-    cid = int(c.data.split(":")[1])
-    kb = await kb_subcategories(cid)
-    await safe_edit_text(c.message, "рџ“Ѓ Р’С‹Р±РµСЂРёС‚Рµ РїРѕРґРєР°С‚РµРіРѕСЂРёСЋ:", reply_markup=kb)
+@router.callback_query(F.data.startswith("shop:cat:"))
+async def shop_category(c: CallbackQuery):
+    category_id = int(c.data.split(":")[-1])
+    subs = await list_subcategories(category_id)
+    if not subs:
+        await safe_edit_text(c.message, await get_setting("no_items"), reply_markup=kb_back("shop:home"))
+        return await c.answer()
+    rows = []
+    for r in subs:
+        rows.append([InlineKeyboardButton(text=r["name"], callback_data=f"shop:sub:{r['id']}:{category_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="shop:home")])
+    rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await safe_edit_text(c.message, await get_setting("choose_subcategory"), reply_markup=kb)
     await c.answer()
 
 
-@router.callback_query(F.data.startswith("sub:"))
-async def cb_subcategory(c: CallbackQuery):
-    _, cid_s, sid_s = c.data.split(":")
-    cid, sid = int(cid_s), int(sid_s)
-    is_staff = await require_min_role(c.from_user.id, "mod")
-    kb = await kb_products(cid, sid, is_staff=is_staff)
-    await safe_edit_text(c.message, "рџ“¦ РўРѕРІР°СЂС‹:", reply_markup=kb)
+@router.callback_query(F.data.startswith("shop:sub:"))
+async def shop_subcategory(c: CallbackQuery):
+    _, _, sub_id, cat_id = c.data.split(":")
+    sub_id = int(sub_id)
+    cat_id = int(cat_id)
+    prods = await list_products(sub_id)
+    if not prods:
+        await safe_edit_text(c.message, await get_setting("no_items"), reply_markup=kb_back(f"shop:cat:{cat_id}"))
+        return await c.answer()
+    rows = []
+    for r in prods:
+        rows.append([InlineKeyboardButton(text=r["name"], callback_data=f"shop:prod:{r['id']}:{sub_id}:{cat_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"shop:cat:{cat_id}")])
+    rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await safe_edit_text(c.message, await get_setting("choose_product"), reply_markup=kb)
     await c.answer()
 
 
-@router.callback_query(F.data.startswith("prod:"))
-async def cb_product(c: CallbackQuery):
-    _, cid_s, sid_s, pid_s = c.data.split(":")
-    cid, sid, pid = int(cid_s), int(sid_s), int(pid_s)
+@router.callback_query(F.data.startswith("shop:prod:"))
+async def shop_product(c: CallbackQuery):
+    _, _, prod_id, sub_id, cat_id = c.data.split(":")
+    prod_id = int(prod_id)
+    sub_id = int(sub_id)
+    cat_id = int(cat_id)
 
-    p = await db_get_product(pid)
+    p = await get_product(prod_id)
     if not p:
-        await c.answer("РўРѕРІР°СЂ РЅРµ РЅР°Р№РґРµРЅ", show_alert=True)
+        await c.answer("Товар не найден", show_alert=True)
         return
 
-    _, _, title, price, desc, media_type, media_file_id, is_active = p
+    name = p["name"]
+    desc = (p["description"] or "").strip()
+    price = (p["price"] or "").strip()
 
-    is_mod = await require_min_role(c.from_user.id, "mod")
-    is_admin = await require_min_role(c.from_user.id, "admin")
-
-    if not is_active and not is_mod:
-        await c.answer("РўРѕРІР°СЂ РЅРµРґРѕСЃС‚СѓРїРµРЅ", show_alert=True)
-        return
-
-    method = await db_get_purchase_method(pid)
-    has_buy = method is not None
-    buy_text = method[2] if method else "РљСѓРїРёС‚СЊ"
-
-    text = f"<b>{title}</b>\n"
+    text = f"<b>{name}</b>\n"
     if price:
-        text += f"рџ’° Р¦РµРЅР°: <b>{price}</b>\n"
+        text += f"\n💰 <b>Цена:</b> {price}\n"
     if desc:
-        text += f"\n{desc}"
+        text += f"\n📝 {desc}\n"
 
-    kb = kb_product_view(cid, sid, pid, buy_text, has_buy, is_mod, is_admin)
+    rows = [
+        [InlineKeyboardButton(text="✅ Купить", callback_data=f"buy:{prod_id}:{sub_id}:{cat_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"shop:sub:{sub_id}:{cat_id}")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="home")],
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    # если есть медиа — отправим/покажем
+    media_type = (p["media_type"] or "").strip()
+    media_file_id = (p["media_file_id"] or "").strip()
 
     try:
         if media_type == "photo" and media_file_id:
-            await safe_delete(c.message)
-            await bot.send_photo(c.message.chat.id, photo=media_file_id, caption=text, reply_markup=kb)
+            await c.message.edit_media(
+                media=InputMediaPhoto(media=media_file_id, caption=text, parse_mode=ParseMode.HTML),
+                reply_markup=kb
+            )
         elif media_type == "video" and media_file_id:
-            await safe_delete(c.message)
-            await bot.send_video(c.message.chat.id, video=media_file_id, caption=text, reply_markup=kb)
+            await c.message.edit_media(
+                media=InputMediaVideo(media=media_file_id, caption=text, parse_mode=ParseMode.HTML),
+                reply_markup=kb
+            )
         else:
             await safe_edit_text(c.message, text, reply_markup=kb)
-    except Exception as e:
-        logger.exception(e)
-        await c.message.answer(text, reply_markup=kb)
+    except Exception:
+        # если не получилось edit_media (например, предыдущее сообщение не медиа)
+        if media_type == "photo" and media_file_id:
+            await c.message.answer_photo(media_file_id, caption=text, reply_markup=kb)
+        elif media_type == "video" and media_file_id:
+            await c.message.answer_video(media_file_id, caption=text, reply_markup=kb)
+        else:
+            await c.message.answer(text, reply_markup=kb)
 
     await c.answer()
 
 
 @router.callback_query(F.data.startswith("buy:"))
-async def cb_buy(c: CallbackQuery):
-    pid = int(c.data.split(":")[1])
-    method = await db_get_purchase_method(pid)
-    if not method:
-        await c.answer("РЎРїРѕСЃРѕР± РїРѕРєСѓРїРєРё РЅРµ РЅР°СЃС‚СЂРѕРµРЅ", show_alert=True)
+async def buy_menu(c: CallbackQuery):
+    _, prod_id, sub_id, cat_id = c.data.split(":")
+    prod_id = int(prod_id); sub_id = int(sub_id); cat_id = int(cat_id)
+
+    methods = await list_buy_methods(prod_id)
+    if not methods:
+        await c.answer("Способы покупки не настроены", show_alert=True)
         return
 
-    method_type, payload_str, button_text = method
-    payload = json.loads(payload_str)
+    rows = []
+    for m in methods:
+        rows.append([InlineKeyboardButton(text=m["title"], url=m["url"])])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"shop:prod:{prod_id}:{sub_id}:{cat_id}")])
+    rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
 
-    if method_type == "link":
-        url = payload.get("url", "").strip()
-        if not url:
-            await c.answer("РЎСЃС‹Р»РєР° РЅРµ Р·Р°РґР°РЅР°", show_alert=True)
-            return
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=button_text, url=url)]])
-        await c.message.answer("РќР°Р¶РјРёС‚Рµ РєРЅРѕРїРєСѓ РґР»СЏ РїРѕРєСѓРїРєРё:", reply_markup=kb)
-        await c.answer()
-
-    elif method_type == "manager":
-        username = payload.get("username", "").strip()
-        template = payload.get("template", "Р—РґСЂР°РІСЃС‚РІСѓР№С‚Рµ! РҐРѕС‡Сѓ РєСѓРїРёС‚СЊ С‚РѕРІР°СЂ: {product_id}")
-        msg = template.format(product_id=pid)
-        if username and not username.startswith("@"):
-            username = "@" + username
-        await c.message.answer(
-            f"РќР°РїРёС€РёС‚Рµ РјРµРЅРµРґР¶РµСЂСѓ: <b>{username}</b>\n\n"
-            f"РЎРѕРѕР±С‰РµРЅРёРµ:\n<code>{msg}</code>"
-        )
-        await c.answer()
-
-    elif method_type == "text":
-        text = payload.get("text", "").strip()
-        if not text:
-            await c.answer("РўРµРєСЃС‚ РЅРµ Р·Р°РґР°РЅ", show_alert=True)
-            return
-        await c.message.answer(text)
-        await c.answer()
-    else:
-        await c.answer("РќРµРёР·РІРµСЃС‚РЅС‹Р№ РјРµС‚РѕРґ РїРѕРєСѓРїРєРё", show_alert=True)
-
-
-# =========================
-# ADMIN ENTRY
-# =========================
-@router.message(Command("admin"))
-async def cmd_admin(m: Message):
-    if not m.from_user:
-        return
-    if not await require_min_role(m.from_user.id, "mod"):
-        await m.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°.")
-        return
-    is_owner = await require_min_role(m.from_user.id, "owner")
-    await m.answer("вљ™пёЏ РђРґРјРёРЅ-РїР°РЅРµР»СЊ:", reply_markup=kb_admin_panel(is_owner=is_owner))
-
-
-@router.callback_query(F.data == "adm_back_admin")
-async def cb_adm_back(c: CallbackQuery):
-    is_owner = await require_min_role(c.from_user.id, "owner")
-    await safe_edit_text(c.message, "вљ™пёЏ РђРґРјРёРЅ-РїР°РЅРµР»СЊ:", reply_markup=kb_admin_panel(is_owner=is_owner))
+    await safe_edit_text(c.message, "✅ Выберите способ покупки:", reply_markup=kb)
     await c.answer()
 
 
-# =========================
-# ADD CATEGORY / SUB / PRODUCT (РєР°Рє СЂР°РЅСЊС€Рµ)
-# =========================
-@router.callback_query(F.data == "adm_add_cat")
-async def cb_add_cat(c: CallbackQuery, state: FSMContext):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќСѓР¶РЅРѕ Р±С‹С‚СЊ admin", show_alert=True)
-        return
-    await state.set_state(AddCategory.title)
-    await safe_edit_text(c.message, "Р’РІРµРґРёС‚Рµ РЅР°Р·РІР°РЅРёРµ РЅРѕРІРѕР№ РєР°С‚РµРіРѕСЂРёРё:")
+# -------------------- ADMIN UI --------------------
+def admin_home_kb(role: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="📦 Категории", callback_data="adm:cats")],
+        [InlineKeyboardButton(text="✏️ Редактировать тексты", callback_data="adm:texts")],
+    ]
+    if role_at_least(role, ROLE_ADMIN):
+        rows.append([InlineKeyboardButton(text="👥 Админы/модераторы", callback_data="adm:staff")])
+    rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "admin:home")
+async def cb_admin_home(c: CallbackQuery):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
+    await safe_edit_text(c.message, "⚙️ Админ панель", reply_markup=admin_home_kb(role))
     await c.answer()
 
 
-@router.message(AddCategory.title)
-async def st_add_cat_title(m: Message, state: FSMContext):
-    if not m.from_user or not await require_min_role(m.from_user.id, "admin"):
+# -------------------- ADMIN: TEXTS --------------------
+@router.callback_query(F.data == "adm:texts")
+async def adm_texts(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
+
+    keys = [
+        ("start_text", "Стартовое сообщение"),
+        ("support_text", "Поддержка"),
+        ("group_welcome_text", "Приветствие в группе"),
+        ("group_welcome_button", "Текст кнопки приветствия"),
+    ]
+
+    rows = []
+    for k, title in keys:
+        rows.append([InlineKeyboardButton(text=title, callback_data=f"txt:{k}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await safe_edit_text(c.message, "✏️ Выберите текст для редактирования:", reply_markup=kb)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("txt:"))
+async def adm_text_pick(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
+
+    key = c.data.split(":", 1)[1]
+    cur = await get_setting(key)
+    await state.update_data(text_key=key)
+
+    await safe_edit_text(
+        c.message,
+        f"Текущий текст для <b>{key}</b>:\n\n{cur}\n\n"
+        "Отправьте новый текст (или '-' чтобы очистить):",
+        reply_markup=kb_back("adm:texts")
+    )
+    await state.set_state(EditTexts.value)
+    await c.answer()
+
+
+@router.message(EditTexts.value)
+async def adm_text_set(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
         return
-    title = (m.text or "").strip()
-    if not title:
-        await m.answer("РќР°Р·РІР°РЅРёРµ РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РїСѓСЃС‚С‹Рј. Р’РІРµРґРёС‚Рµ СЃРЅРѕРІР°:")
-        return
-    await db_add_category(title)
+
+    data = await state.get_data()
+    key = data.get("text_key")
+    if not key:
+        await state.clear()
+        return await m.answer("Ошибка состояния. /admin")
+
+    new_val = m.text or ""
+    if new_val.strip() == "-":
+        new_val = ""
+
+    await set_setting(key, new_val)
     await state.clear()
-    is_owner = await require_min_role(m.from_user.id, "owner")
-    await m.answer(f"вњ… РљР°С‚РµРіРѕСЂРёСЏ РґРѕР±Р°РІР»РµРЅР°: <b>{title}</b>", reply_markup=kb_admin_panel(is_owner=is_owner))
+    await m.answer("✅ Текст обновлён. /admin")
 
 
-@router.callback_query(F.data == "adm_add_sub")
-async def cb_add_sub(c: CallbackQuery, state: FSMContext):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќСѓР¶РЅРѕ Р±С‹С‚СЊ admin", show_alert=True)
-        return
+# -------------------- ADMIN: CATEGORIES / SUBCATS / PRODUCTS --------------------
+@router.callback_query(F.data == "adm:cats")
+async def adm_cats(c: CallbackQuery):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
 
-    cats = await db_get_categories()
-    if not cats:
-        await safe_edit_text(c.message, "РЎРЅР°С‡Р°Р»Р° РґРѕР±Р°РІСЊС‚Рµ РєР°С‚РµРіРѕСЂРёСЋ. /admin", reply_markup=kb_back("adm_back_admin"))
-        await c.answer()
-        return
+    cats = await list_categories()
+    rows = []
+    for r in cats:
+        rows.append([InlineKeyboardButton(text=r["name"], callback_data=f"adm:cat:{r['id']}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить категорию", callback_data="adm:cat_add")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
 
-    rows = [[InlineKeyboardButton(text=title, callback_data=f"adm_pick_cat_for_sub:{cid}")]
-            for cid, title in cats]
-    rows.append([InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data="adm_back_admin")])
-
-    await state.set_state(AddSubcategory.pick_category)
-    await safe_edit_text(c.message, "Р’С‹Р±РµСЂРёС‚Рµ РєР°С‚РµРіРѕСЂРёСЋ:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await safe_edit_text(c.message, "📦 Категории:", reply_markup=kb)
     await c.answer()
 
 
-@router.callback_query(AddSubcategory.pick_category, F.data.startswith("adm_pick_cat_for_sub:"))
-async def cb_pick_cat_for_sub(c: CallbackQuery, state: FSMContext):
-    cid = int(c.data.split(":")[1])
-    await state.update_data(category_id=cid)
-    await state.set_state(AddSubcategory.title)
-    await safe_edit_text(c.message, "Р’РІРµРґРёС‚Рµ РЅР°Р·РІР°РЅРёРµ РїРѕРґРєР°С‚РµРіРѕСЂРёРё:")
+@router.callback_query(F.data == "adm:cat_add")
+async def adm_cat_add(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
+    await safe_edit_text(c.message, "Введите название новой категории:", reply_markup=kb_back("adm:cats"))
+    await state.set_state(AdminAddCategory.name)
     await c.answer()
 
 
-@router.message(AddSubcategory.title)
-async def st_add_sub_title(m: Message, state: FSMContext):
-    if not m.from_user or not await require_min_role(m.from_user.id, "admin"):
+@router.message(AdminAddCategory.name)
+async def adm_cat_add_save(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
         return
-    title = (m.text or "").strip()
-    if not title:
-        await m.answer("РќР°Р·РІР°РЅРёРµ РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РїСѓСЃС‚С‹Рј. Р’РІРµРґРёС‚Рµ СЃРЅРѕРІР°:")
+
+    name = (m.text or "").strip()
+    if not name:
+        return await m.answer("Введите название текстом.")
+
+    conn = await db()
+    try:
+        await conn.execute("INSERT INTO categories(name, pos) VALUES(?, 0)", (name,))
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    await state.clear()
+    await m.answer("✅ Категория добавлена. /admin")
+
+
+@router.callback_query(F.data.startswith("adm:cat:"))
+async def adm_cat_menu(c: CallbackQuery):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
+    cat_id = int(c.data.split(":")[-1])
+
+    subs = await list_subcategories(cat_id)
+    rows = []
+    for s in subs:
+        rows.append([InlineKeyboardButton(text=s["name"], callback_data=f"adm:sub:{s['id']}:{cat_id}")])
+
+    rows.append([InlineKeyboardButton(text="➕ Добавить подкатегорию", callback_data=f"adm:sub_add:{cat_id}")])
+    rows.append([InlineKeyboardButton(text="✏️ Переименовать категорию", callback_data=f"adm:cat_edit:{cat_id}")])
+    rows.append([InlineKeyboardButton(text="🗑️ Удалить категорию", callback_data=f"adm:cat_del:{cat_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:cats")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    await safe_edit_text(c.message, "📦 Категория → Подкатегории:", reply_markup=kb)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("adm:cat_edit:"))
+async def adm_cat_edit(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
+    cat_id = int(c.data.split(":")[-1])
+    await state.update_data(category_id=cat_id)
+    await safe_edit_text(c.message, "Введите новое название категории:", reply_markup=kb_back(f"adm:cat:{cat_id}"))
+    await state.set_state(AdminEditCategory.name)
+    await c.answer()
+
+
+@router.message(AdminEditCategory.name)
+async def adm_cat_edit_save(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
         return
     data = await state.get_data()
-    cid = int(data["category_id"])
-    await db_add_subcategory(cid, title)
+    cat_id = int(data.get("category_id") or 0)
+    name = (m.text or "").strip()
+    if not cat_id or not name:
+        await state.clear()
+        return await m.answer("Ошибка.")
+    conn = await db()
+    try:
+        await conn.execute("UPDATE categories SET name=? WHERE id=?", (name, cat_id))
+        await conn.commit()
+    finally:
+        await conn.close()
     await state.clear()
-    is_owner = await require_min_role(m.from_user.id, "owner")
-    await m.answer(f"вњ… РџРѕРґРєР°С‚РµРіРѕСЂРёСЏ РґРѕР±Р°РІР»РµРЅР°: <b>{title}</b>", reply_markup=kb_admin_panel(is_owner=is_owner))
+    await m.answer("✅ Категория обновлена. /admin")
 
 
-@router.callback_query(F.data == "adm_add_product")
-async def cb_add_product(c: CallbackQuery, state: FSMContext):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќСѓР¶РЅРѕ Р±С‹С‚СЊ admin", show_alert=True)
-        return
+@router.callback_query(F.data.startswith("adm:cat_del:"))
+async def adm_cat_del(c: CallbackQuery):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_ADMIN):
+        return await c.answer("⛔ Нужно быть admin/owner", show_alert=True)
+    cat_id = int(c.data.split(":")[-1])
 
-    cats = await db_get_categories()
-    if not cats:
-        await safe_edit_text(c.message, "РЎРЅР°С‡Р°Р»Р° РґРѕР±Р°РІСЊС‚Рµ РєР°С‚РµРіРѕСЂРёСЋ. /admin", reply_markup=kb_back("adm_back_admin"))
-        await c.answer()
-        return
+    conn = await db()
+    try:
+        await conn.execute("DELETE FROM categories WHERE id=?", (cat_id,))
+        await conn.commit()
+    finally:
+        await conn.close()
 
-    rows = [[InlineKeyboardButton(text=title, callback_data=f"adm_prod_cat:{cid}")]
-            for cid, title in cats]
-    rows.append([InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data="adm_back_admin")])
-
-    await state.set_state(AddProduct.pick_category)
-    await safe_edit_text(c.message, "Р’С‹Р±РµСЂРёС‚Рµ РєР°С‚РµРіРѕСЂРёСЋ:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await safe_edit_text(c.message, "🗑️ Категория удалена.", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:cats")]]
+    ))
     await c.answer()
 
 
-@router.callback_query(AddProduct.pick_category, F.data.startswith("adm_prod_cat:"))
-async def cb_prod_pick_cat(c: CallbackQuery, state: FSMContext):
-    cid = int(c.data.split(":")[1])
-    subs = await db_get_subcategories(cid)
-    if not subs:
-        await c.answer("РќРµС‚ РїРѕРґРєР°С‚РµРіРѕСЂРёР№. РЎРЅР°С‡Р°Р»Р° СЃРѕР·РґР°Р№С‚Рµ РїРѕРґРєР°С‚РµРіРѕСЂРёСЋ.", show_alert=True)
-        return
-
-    rows = [[InlineKeyboardButton(text=title, callback_data=f"adm_prod_sub:{cid}:{sid}")]
-            for sid, title in subs]
-    rows.append([InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data="adm_add_product")])
-
-    await state.set_state(AddProduct.pick_subcategory)
-    await safe_edit_text(c.message, "Р’С‹Р±РµСЂРёС‚Рµ РїРѕРґРєР°С‚РµРіРѕСЂРёСЋ:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+@router.callback_query(F.data.startswith("adm:sub_add:"))
+async def adm_sub_add(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
+    cat_id = int(c.data.split(":")[-1])
+    await state.update_data(category_id=cat_id)
+    await safe_edit_text(c.message, "Введите название подкатегории:", reply_markup=kb_back(f"adm:cat:{cat_id}"))
+    await state.set_state(AdminAddSubcategory.name)
     await c.answer()
 
 
-@router.callback_query(AddProduct.pick_subcategory, F.data.startswith("adm_prod_sub:"))
-async def cb_prod_pick_sub(c: CallbackQuery, state: FSMContext):
-    _, cid_s, sid_s = c.data.split(":")
-    await state.update_data(category_id=int(cid_s), subcategory_id=int(sid_s))
-    await state.set_state(AddProduct.title)
-    await safe_edit_text(c.message, "Р’РІРµРґРёС‚Рµ РЅР°Р·РІР°РЅРёРµ С‚РѕРІР°СЂР°:")
+@router.message(AdminAddSubcategory.name)
+async def adm_sub_add_save(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return
+    data = await state.get_data()
+    cat_id = int(data.get("category_id") or 0)
+    name = (m.text or "").strip()
+    if not cat_id or not name:
+        await state.clear()
+        return await m.answer("Ошибка.")
+    conn = await db()
+    try:
+        await conn.execute("INSERT INTO subcategories(category_id, name, pos) VALUES(?,?,0)", (cat_id, name))
+        await conn.commit()
+    finally:
+        await conn.close()
+    await state.clear()
+    await m.answer("✅ Подкатегория добавлена. /admin")
+
+
+@router.callback_query(F.data.startswith("adm:sub:"))
+async def adm_sub_menu(c: CallbackQuery):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
+
+    _, _, sub_id, cat_id = c.data.split(":")
+    sub_id = int(sub_id)
+    cat_id = int(cat_id)
+
+    prods = await list_products(sub_id)
+    rows = []
+    for p in prods:
+        rows.append([InlineKeyboardButton(text=p["name"], callback_data=f"adm:prod:{p['id']}:{sub_id}:{cat_id}")])
+
+    rows.append([InlineKeyboardButton(text="➕ Добавить товар", callback_data=f"adm:prod_add:{sub_id}:{cat_id}")])
+    rows.append([InlineKeyboardButton(text="✏️ Переименовать подкатегорию", callback_data=f"adm:sub_edit:{sub_id}:{cat_id}")])
+    rows.append([InlineKeyboardButton(text="🗑️ Удалить подкатегорию", callback_data=f"adm:sub_del:{sub_id}:{cat_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm:cat:{cat_id}")])
+
+    await safe_edit_text(c.message, "📁 Подкатегория → Товары:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await c.answer()
 
 
-@router.message(AddProduct.title)
-async def st_prod_title(m: Message, state: FSMContext):
-    title = (m.text or "").strip()
-    if not title:
-        await m.answer("РќР°Р·РІР°РЅРёРµ РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РїСѓСЃС‚С‹Рј. Р’РІРµРґРёС‚Рµ СЃРЅРѕРІР°:")
+@router.callback_query(F.data.startswith("adm:sub_edit:"))
+async def adm_sub_edit(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
+
+    _, _, sub_id, cat_id = c.data.split(":")
+    await state.update_data(subcategory_id=int(sub_id), category_id=int(cat_id))
+    await safe_edit_text(c.message, "Введите новое название подкатегории:", reply_markup=kb_back(f"adm:sub:{sub_id}:{cat_id}"))
+    await state.set_state(AdminEditSubcategory.name)
+    await c.answer()
+
+
+@router.message(AdminEditSubcategory.name)
+async def adm_sub_edit_save(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
         return
-    await state.update_data(title=title)
-    await state.set_state(AddProduct.price)
-    await m.answer("Р’РІРµРґРёС‚Рµ С†РµРЅСѓ (РёР»Рё '-' РµСЃР»Рё РЅРµ РЅСѓР¶РЅРѕ):")
+    data = await state.get_data()
+    sub_id = int(data.get("subcategory_id") or 0)
+    name = (m.text or "").strip()
+    if not sub_id or not name:
+        await state.clear()
+        return await m.answer("Ошибка.")
+    conn = await db()
+    try:
+        await conn.execute("UPDATE subcategories SET name=? WHERE id=?", (name, sub_id))
+        await conn.commit()
+    finally:
+        await conn.close()
+    await state.clear()
+    await m.answer("✅ Подкатегория обновлена. /admin")
 
 
-@router.message(AddProduct.price)
-async def st_prod_price(m: Message, state: FSMContext):
-    price = (m.text or "").strip()
-    if price == "-":
-        price = ""
-    await state.update_data(price=price)
-    await state.set_state(AddProduct.description)
-    await m.answer("Р’РІРµРґРёС‚Рµ РѕРїРёСЃР°РЅРёРµ (РёР»Рё '-' РµСЃР»Рё РЅРµ РЅСѓР¶РЅРѕ):")
+@router.callback_query(F.data.startswith("adm:sub_del:"))
+async def adm_sub_del(c: CallbackQuery):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_ADMIN):
+        return await c.answer("⛔ Нужно быть admin/owner", show_alert=True)
+
+    _, _, sub_id, cat_id = c.data.split(":")
+    sub_id = int(sub_id); cat_id = int(cat_id)
+
+    conn = await db()
+    try:
+        await conn.execute("DELETE FROM subcategories WHERE id=?", (sub_id,))
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    await safe_edit_text(c.message, "🗑️ Подкатегория удалена.", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm:cat:{cat_id}")]]
+    ))
+    await c.answer()
 
 
-@router.message(AddProduct.description)
-async def st_prod_desc(m: Message, state: FSMContext):
+@router.callback_query(F.data.startswith("adm:prod_add:"))
+async def adm_prod_add(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
+
+    _, _, sub_id, cat_id = c.data.split(":")
+    await state.update_data(subcategory_id=int(sub_id), category_id=int(cat_id))
+    await safe_edit_text(c.message, "Введите название товара:", reply_markup=kb_back(f"adm:sub:{sub_id}:{cat_id}"))
+    await state.set_state(AdminAddProduct.name)
+    await c.answer()
+
+
+@router.message(AdminAddProduct.name)
+async def adm_prod_add_name(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return
+    name = (m.text or "").strip()
+    if not name:
+        return await m.answer("Введите название.")
+    await state.update_data(name=name)
+    await m.answer("Отправьте описание товара (или '-' чтобы пропустить):")
+    await state.set_state(AdminAddProduct.description)
+
+
+@router.message(AdminAddProduct.description)
+async def adm_prod_add_desc(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return
     desc = (m.text or "").strip()
     if desc == "-":
         desc = ""
     await state.update_data(description=desc)
-    await state.set_state(AddProduct.media)
-    await m.answer("РћС‚РїСЂР°РІСЊС‚Рµ С„РѕС‚Рѕ/РІРёРґРµРѕ РґР»СЏ С‚РѕРІР°СЂР° РёР»Рё '-' С‡С‚РѕР±С‹ РїСЂРѕРїСѓСЃС‚РёС‚СЊ:")
+    await m.answer("Введите цену (или '-' чтобы пропустить):")
+    await state.set_state(AdminAddProduct.price)
 
 
-@router.message(AddProduct.media)
-async def st_prod_media(m: Message, state: FSMContext):
+@router.message(AdminAddProduct.price)
+async def adm_prod_add_price(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return
+    price = (m.text or "").strip()
+    if price == "-":
+        price = ""
+    await state.update_data(price=price)
+    await m.answer("Отправьте фото/видео (или '-' чтобы пропустить):")
+    await state.set_state(AdminAddProduct.media)
+
+
+@router.message(AdminAddProduct.media)
+async def adm_prod_add_media(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return
+
+    data = await state.get_data()
+    sub_id = int(data.get("subcategory_id") or 0)
+    cat_id = int(data.get("category_id") or 0)
+    name = data.get("name", "")
+    desc = data.get("description", "")
+    price = data.get("price", "")
+
     media_type = ""
     media_file_id = ""
 
-    if m.text and m.text.strip() == "-":
+    if (m.text or "").strip() == "-":
         pass
     elif m.photo:
         media_type = "photo"
@@ -878,691 +944,474 @@ async def st_prod_media(m: Message, state: FSMContext):
         media_type = "video"
         media_file_id = m.video.file_id
     else:
-        await m.answer("РќСѓР¶РЅРѕ С„РѕС‚Рѕ/РІРёРґРµРѕ РёР»Рё '-' С‡С‚РѕР±С‹ РїСЂРѕРїСѓСЃС‚РёС‚СЊ. РџРѕРїСЂРѕР±СѓР№С‚Рµ РµС‰С‘ СЂР°Р·:")
-        return
+        return await m.answer("Пришлите фото/видео или '-'.")
 
-    await state.update_data(media_type=media_type, media_file_id=media_file_id)
-    await state.set_state(AddProduct.purchase_type)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="рџ”— РЎСЃС‹Р»РєР° (URL)", callback_data="pm_type:link")],
-        [InlineKeyboardButton(text="рџ‘¤ РњРµРЅРµРґР¶РµСЂ (@username)", callback_data="pm_type:manager")],
-        [InlineKeyboardButton(text="рџ“ќ РўРµРєСЃС‚/РёРЅСЃС‚СЂСѓРєС†РёСЏ", callback_data="pm_type:text")],
-    ])
-    await m.answer("Р’С‹Р±РµСЂРёС‚Рµ СЃРїРѕСЃРѕР± РїРѕРєСѓРїРєРё:", reply_markup=kb)
-
-
-@router.callback_query(AddProduct.purchase_type, F.data.startswith("pm_type:"))
-async def cb_pm_type(c: CallbackQuery, state: FSMContext):
-    ptype = c.data.split(":")[1]
-    await state.update_data(purchase_type=ptype)
-    await state.set_state(AddProduct.purchase_payload)
-
-    if ptype == "link":
-        await safe_edit_text(c.message, "РћС‚РїСЂР°РІСЊС‚Рµ СЃСЃС‹Р»РєСѓ (URL) РґР»СЏ РїРѕРєСѓРїРєРё:")
-    elif ptype == "manager":
-        await safe_edit_text(c.message, "РћС‚РїСЂР°РІСЊС‚Рµ username РјРµРЅРµРґР¶РµСЂР° (@manager РёР»Рё manager):")
-    else:
-        await safe_edit_text(c.message, "РћС‚РїСЂР°РІСЊС‚Рµ С‚РµРєСЃС‚ РёРЅСЃС‚СЂСѓРєС†РёРё, РєРѕС‚РѕСЂС‹Р№ СѓРІРёРґРёС‚ РїРѕРєСѓРїР°С‚РµР»СЊ:")
-    await c.answer()
-
-
-@router.message(AddProduct.purchase_payload)
-async def st_pm_payload(m: Message, state: FSMContext):
-    txt = (m.text or "").strip()
-    if not txt:
-        await m.answer("РџСѓСЃС‚Рѕ. Р’РІРµРґРёС‚Рµ РµС‰С‘ СЂР°Р·:")
-        return
-
-    data = await state.get_data()
-    ptype = data["purchase_type"]
-
-    if ptype == "link":
-        payload = {"url": txt}
-    elif ptype == "manager":
-        username = txt[1:] if txt.startswith("@") else txt
-        payload = {"username": username, "template": "Р—РґСЂР°РІСЃС‚РІСѓР№С‚Рµ! РҐРѕС‡Сѓ РєСѓРїРёС‚СЊ С‚РѕРІР°СЂ (id={product_id})."}
-    else:
-        payload = {"text": txt}
-
-    await state.update_data(purchase_payload=payload)
-    await state.set_state(AddProduct.purchase_button_text)
-    await m.answer("РўРµРєСЃС‚ РєРЅРѕРїРєРё? (РЅР°РїСЂРёРјРµСЂ: РљСѓРїРёС‚СЊ/РћРїР»Р°С‚РёС‚СЊ/РџРµСЂРµР№С‚Рё) РёР»Рё '-' РґР»СЏ 'РљСѓРїРёС‚СЊ':")
-
-
-@router.message(AddProduct.purchase_button_text)
-async def st_pm_btn(m: Message, state: FSMContext):
-    btn = (m.text or "").strip()
-    if btn == "-" or not btn:
-        btn = "РљСѓРїРёС‚СЊ"
-
-    data = await state.get_data()
-    subcategory_id = int(data["subcategory_id"])
-    title = data["title"]
-    price = data["price"]
-    description = data["description"]
-    media_type = data["media_type"]
-    media_file_id = data["media_file_id"]
-    ptype = data["purchase_type"]
-    payload = data["purchase_payload"]
-
-    new_pid = await db_add_product(subcategory_id, title, price, description, media_type, media_file_id)
-    await db_upsert_purchase_method(new_pid, ptype, payload, btn)
+    conn = await db()
+    try:
+        cur = await conn.execute(
+            "INSERT INTO products(subcategory_id, name, description, price, media_type, media_file_id, pos) "
+            "VALUES(?,?,?,?,?,?,0)",
+            (sub_id, name, desc, price, media_type, media_file_id)
+        )
+        prod_id = cur.lastrowid
+        await conn.commit()
+    finally:
+        await conn.close()
 
     await state.clear()
-    is_owner = await require_min_role(m.from_user.id, "owner")
-    await m.answer(f"вњ… РўРѕРІР°СЂ РґРѕР±Р°РІР»РµРЅ: <b>{title}</b> (id=<code>{new_pid}</code>)",
-                   reply_markup=kb_admin_panel(is_owner=is_owner))
+    await m.answer(f"✅ Товар добавлен.\nТеперь добавьте способы покупки: /admin\n(найдите товар и нажмите «Способы покупки»)")
 
 
-# =========================
-# MOD/ADMIN actions
-# =========================
-@router.callback_query(F.data.startswith("adm_toggle:"))
-async def cb_toggle(c: CallbackQuery):
-    if not await require_min_role(c.from_user.id, "mod"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    pid = int(c.data.split(":")[1])
-    await db_toggle_product_active(pid)
-    await c.answer("Р“РѕС‚РѕРІРѕ вњ…")
+@router.callback_query(F.data.startswith("adm:prod:"))
+async def adm_prod_menu(c: CallbackQuery):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
 
+    _, _, prod_id, sub_id, cat_id = c.data.split(":")
+    prod_id = int(prod_id); sub_id = int(sub_id); cat_id = int(cat_id)
 
-# =========================
-# EDIT CATALOG (РєР°С‚РµРіРѕСЂРёРё/РїРѕРґРєР°С‚РµРіРѕСЂРёРё/С‚РѕРІР°СЂС‹)
-# =========================
-@router.callback_query(F.data == "adm_edit_catalog")
-async def cb_edit_catalog(c: CallbackQuery):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќСѓР¶РЅРѕ Р±С‹С‚СЊ admin", show_alert=True)
-        return
-    cats = await db_get_categories()
-    if not cats:
-        await safe_edit_text(c.message, "РљР°С‚РµРіРѕСЂРёР№ РЅРµС‚. Р”РѕР±Р°РІСЊС‚Рµ РєР°С‚РµРіРѕСЂРёСЋ.", reply_markup=kb_back("adm_back_admin"))
-        await c.answer()
-        return
-
-    rows = []
-    for cid, title in cats:
-        rows.append([
-            InlineKeyboardButton(text=title, callback_data=f"adm_cat_manage:{cid}")
-        ])
-    rows.append([InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data="adm_back_admin")])
-
-    await safe_edit_text(c.message, "вњЏпёЏ Р РµРґР°РєС‚РёСЂРѕРІР°РЅРёРµ: РІС‹Р±РµСЂРёС‚Рµ РєР°С‚РµРіРѕСЂРёСЋ", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await c.answer()
-
-
-@router.callback_query(F.data.startswith("adm_cat_manage:"))
-async def cb_cat_manage(c: CallbackQuery):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    cid = int(c.data.split(":")[1])
-    cat = await db_get_category(cid)
-    if not cat:
-        await c.answer("РљР°С‚РµРіРѕСЂРёСЏ РЅРµ РЅР°Р№РґРµРЅР°", show_alert=True)
-        return
-    _, title = cat
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="вњЏпёЏ РџРµСЂРµРёРјРµРЅРѕРІР°С‚СЊ РєР°С‚РµРіРѕСЂРёСЋ", callback_data=f"adm_cat_rename:{cid}")],
-        [InlineKeyboardButton(text="рџ—‘ РЈРґР°Р»РёС‚СЊ РєР°С‚РµРіРѕСЂРёСЋ", callback_data=f"adm_cat_delete:{cid}")],
-        [InlineKeyboardButton(text="рџ“Ѓ РЈРїСЂР°РІР»СЏС‚СЊ РїРѕРґРєР°С‚РµРіРѕСЂРёСЏРјРё", callback_data=f"adm_sub_list:{cid}")],
-        [InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data="adm_edit_catalog")],
-    ])
-    await safe_edit_text(c.message, f"РљР°С‚РµРіРѕСЂРёСЏ: <b>{title}</b>\nР§С‚Рѕ СЃРґРµР»Р°С‚СЊ?", reply_markup=kb)
-    await c.answer()
-
-
-@router.callback_query(F.data.startswith("adm_cat_delete:"))
-async def cb_cat_delete(c: CallbackQuery):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    cid = int(c.data.split(":")[1])
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="вњ… Р”Р°, СѓРґР°Р»РёС‚СЊ", callback_data=f"adm_cat_delete_yes:{cid}")],
-        [InlineKeyboardButton(text="вќЊ РћС‚РјРµРЅР°", callback_data=f"adm_cat_manage:{cid}")],
-    ])
-    await safe_edit_text(c.message, "РЈРґР°Р»РёС‚СЊ РєР°С‚РµРіРѕСЂРёСЋ? (РЈРґР°Р»СЏС‚СЃСЏ Рё РїРѕРґРєР°С‚РµРіРѕСЂРёРё/С‚РѕРІР°СЂС‹ РІРЅСѓС‚СЂРё)", reply_markup=kb)
-    await c.answer()
-
-
-@router.callback_query(F.data.startswith("adm_cat_delete_yes:"))
-async def cb_cat_delete_yes(c: CallbackQuery):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    cid = int(c.data.split(":")[1])
-    await db_delete_category(cid)
-    await c.answer("РЈРґР°Р»РµРЅРѕ вњ…")
-    # РІРµСЂРЅС‘РјСЃСЏ Рє СЃРїРёСЃРєСѓ
-    await cb_edit_catalog(c)
-
-
-@router.callback_query(F.data.startswith("adm_cat_rename:"))
-async def cb_cat_rename(c: CallbackQuery, state: FSMContext):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    cid = int(c.data.split(":")[1])
-    await state.set_state(EditCategory.category_id)
-    await state.update_data(category_id=cid)
-    await state.set_state(EditCategory.new_title)
-    await c.message.answer("Р’РІРµРґРёС‚Рµ РЅРѕРІРѕРµ РЅР°Р·РІР°РЅРёРµ РєР°С‚РµРіРѕСЂРёРё:")
-    await c.answer()
-
-
-@router.message(EditCategory.new_title)
-async def st_cat_new_title(m: Message, state: FSMContext):
-    if not m.from_user or not await require_min_role(m.from_user.id, "admin"):
-        return
-    title = (m.text or "").strip()
-    if not title:
-        await m.answer("РџСѓСЃС‚Рѕ. Р’РІРµРґРёС‚Рµ РµС‰С‘ СЂР°Р·:")
-        return
-    data = await state.get_data()
-    cid = int(data["category_id"])
-    await db_rename_category(cid, title)
-    await state.clear()
-    await m.answer("вњ… РљР°С‚РµРіРѕСЂРёСЏ РїРµСЂРµРёРјРµРЅРѕРІР°РЅР°. /admin")
-
-
-# ----- subcategories manage -----
-@router.callback_query(F.data.startswith("adm_sub_list:"))
-async def cb_sub_list(c: CallbackQuery):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    cid = int(c.data.split(":")[1])
-    subs = await db_get_subcategories(cid)
-    rows = []
-    for sid, title in subs:
-        rows.append([InlineKeyboardButton(text=title, callback_data=f"adm_sub_manage:{cid}:{sid}")])
-    rows.append([InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data=f"adm_cat_manage:{cid}")])
-    await safe_edit_text(c.message, "РџРѕРґРєР°С‚РµРіРѕСЂРёРё: РІС‹Р±РµСЂРёС‚Рµ", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await c.answer()
-
-
-@router.callback_query(F.data.startswith("adm_sub_manage:"))
-async def cb_sub_manage(c: CallbackQuery):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    _, cid_s, sid_s = c.data.split(":")
-    cid, sid = int(cid_s), int(sid_s)
-    sub = await db_get_subcategory(sid)
-    if not sub:
-        await c.answer("РџРѕРґРєР°С‚РµРіРѕСЂРёСЏ РЅРµ РЅР°Р№РґРµРЅР°", show_alert=True)
-        return
-    _, _, title = sub
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="вњЏпёЏ РџРµСЂРµРёРјРµРЅРѕРІР°С‚СЊ РїРѕРґРєР°С‚РµРіРѕСЂРёСЋ", callback_data=f"adm_sub_rename:{sid}")],
-        [InlineKeyboardButton(text="рџ—‘ РЈРґР°Р»РёС‚СЊ РїРѕРґРєР°С‚РµРіРѕСЂРёСЋ", callback_data=f"adm_sub_delete:{cid}:{sid}")],
-        [InlineKeyboardButton(text="рџ“¦ РЈРїСЂР°РІР»СЏС‚СЊ С‚РѕРІР°СЂР°РјРё", callback_data=f"adm_prod_list:{cid}:{sid}")],
-        [InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data=f"adm_sub_list:{cid}")],
-    ])
-    await safe_edit_text(c.message, f"РџРѕРґРєР°С‚РµРіРѕСЂРёСЏ: <b>{title}</b>\nР§С‚Рѕ СЃРґРµР»Р°С‚СЊ?", reply_markup=kb)
-    await c.answer()
-
-
-@router.callback_query(F.data.startswith("adm_sub_delete:"))
-async def cb_sub_delete(c: CallbackQuery):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    _, cid_s, sid_s = c.data.split(":")
-    cid, sid = int(cid_s), int(sid_s)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="вњ… Р”Р°, СѓРґР°Р»РёС‚СЊ", callback_data=f"adm_sub_delete_yes:{cid}:{sid}")],
-        [InlineKeyboardButton(text="вќЊ РћС‚РјРµРЅР°", callback_data=f"adm_sub_manage:{cid}:{sid}")],
-    ])
-    await safe_edit_text(c.message, "РЈРґР°Р»РёС‚СЊ РїРѕРґРєР°С‚РµРіРѕСЂРёСЋ? (РўРѕРІР°СЂС‹ РІРЅСѓС‚СЂРё СѓРґР°Р»СЏС‚СЃСЏ)", reply_markup=kb)
-    await c.answer()
-
-
-@router.callback_query(F.data.startswith("adm_sub_delete_yes:"))
-async def cb_sub_delete_yes(c: CallbackQuery):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    _, cid_s, sid_s = c.data.split(":")
-    cid, sid = int(cid_s), int(sid_s)
-    await db_delete_subcategory(sid)
-    await c.answer("РЈРґР°Р»РµРЅРѕ вњ…")
-    await cb_sub_list(c)  # РІРµСЂРЅС‘РјСЃСЏ Рє СЃРїРёСЃРєСѓ РїРѕРґРєР°С‚РµРіРѕСЂРёР№
-
-
-@router.callback_query(F.data.startswith("adm_sub_rename:"))
-async def cb_sub_rename(c: CallbackQuery, state: FSMContext):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    sid = int(c.data.split(":")[1])
-    await state.set_state(EditSubcategory.subcategory_id)
-    await state.update_data(subcategory_id=sid)
-    await state.set_state(EditSubcategory.new_title)
-    await c.message.answer("Р’РІРµРґРёС‚Рµ РЅРѕРІРѕРµ РЅР°Р·РІР°РЅРёРµ РїРѕРґРєР°С‚РµРіРѕСЂРёРё:")
-    await c.answer()
-
-
-@router.message(EditSubcategory.new_title)
-async def st_sub_new_title(m: Message, state: FSMContext):
-    if not m.from_user or not await require_min_role(m.from_user.id, "admin"):
-        return
-    title = (m.text or "").strip()
-    if not title:
-        await m.answer("РџСѓСЃС‚Рѕ. Р’РІРµРґРёС‚Рµ РµС‰С‘ СЂР°Р·:")
-        return
-    data = await state.get_data()
-    sid = int(data["subcategory_id"])
-    await db_rename_subcategory(sid, title)
-    await state.clear()
-    await m.answer("вњ… РџРѕРґРєР°С‚РµРіРѕСЂРёСЏ РїРµСЂРµРёРјРµРЅРѕРІР°РЅР°. /admin")
-
-
-# ----- products manage -----
-@router.callback_query(F.data.startswith("adm_prod_list:"))
-async def cb_prod_list(c: CallbackQuery):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    _, cid_s, sid_s = c.data.split(":")
-    cid, sid = int(cid_s), int(sid_s)
-    prods = await db_get_products(sid, include_inactive=True)
-    rows = []
-    for pid, title, price, active in prods:
-        label = title + (f" вЂ” {price}" if price else "")
-        if not active:
-            label = "в›” " + label
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"adm_prod_manage:{cid}:{sid}:{pid}")])
-    rows.append([InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data=f"adm_sub_manage:{cid}:{sid}")])
-    await safe_edit_text(c.message, "РўРѕРІР°СЂС‹: РІС‹Р±РµСЂРёС‚Рµ", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await c.answer()
-
-
-@router.callback_query(F.data.startswith("adm_prod_manage:"))
-async def cb_prod_manage(c: CallbackQuery):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    _, cid_s, sid_s, pid_s = c.data.split(":")
-    cid, sid, pid = int(cid_s), int(sid_s), int(pid_s)
-    p = await db_get_product(pid)
+    p = await get_product(prod_id)
     if not p:
-        await c.answer("РўРѕРІР°СЂ РЅРµ РЅР°Р№РґРµРЅ", show_alert=True)
-        return
-    _, _, title, price, desc, media_type, _, is_active = p
-    status = "вњ… Р°РєС‚РёРІРµРЅ" if is_active else "в›” РІС‹РєР»СЋС‡РµРЅ"
+        return await c.answer("Не найдено", show_alert=True)
+
+    text = f"🛍️ <b>{p['name']}</b>\n\n"
+    if p["price"]:
+        text += f"💰 Цена: {p['price']}\n"
+    if p["description"]:
+        text += f"📝 {p['description']}\n"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="вњЏпёЏ Р РµРґР°РєС‚РёСЂРѕРІР°С‚СЊ РїРѕР»СЏ", callback_data=f"adm_edit_product:{pid}")],
-        [InlineKeyboardButton(text="рџ›’ РќР°СЃС‚СЂРѕРёС‚СЊ РїРѕРєСѓРїРєСѓ", callback_data=f"adm_setbuy:{pid}")],
-        [InlineKeyboardButton(text="рџ”Ѓ Р’РєР»/Р’С‹РєР»", callback_data=f"adm_toggle:{pid}")],
-        [InlineKeyboardButton(text="рџ—‘ РЈРґР°Р»РёС‚СЊ С‚РѕРІР°СЂ", callback_data=f"adm_prod_delete:{cid}:{sid}:{pid}")],
-        [InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data=f"adm_prod_list:{cid}:{sid}")],
+        [InlineKeyboardButton(text="🧾 Способы покупки", callback_data=f"adm:buy:{prod_id}:{sub_id}:{cat_id}")],
+        [InlineKeyboardButton(text="✏️ Изменить название", callback_data=f"adm:prod_edit_name:{prod_id}:{sub_id}:{cat_id}")],
+        [InlineKeyboardButton(text="✏️ Изменить описание", callback_data=f"adm:prod_edit_desc:{prod_id}:{sub_id}:{cat_id}")],
+        [InlineKeyboardButton(text="✏️ Изменить цену", callback_data=f"adm:prod_edit_price:{prod_id}:{sub_id}:{cat_id}")],
+        [InlineKeyboardButton(text="🖼️ Изменить медиа", callback_data=f"adm:prod_edit_media:{prod_id}:{sub_id}:{cat_id}")],
+        [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data=f"adm:prod_del:{prod_id}:{sub_id}:{cat_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm:sub:{sub_id}:{cat_id}")],
     ])
-    text = f"<b>{title}</b>\nРЎС‚Р°С‚СѓСЃ: {status}\n"
-    if price:
-        text += f"Р¦РµРЅР°: <b>{price}</b>\n"
-    if media_type:
-        text += f"РњРµРґРёР°: <b>{media_type}</b>\n"
-    if desc:
-        text += f"\n{desc}"
+
     await safe_edit_text(c.message, text, reply_markup=kb)
     await c.answer()
 
 
-@router.callback_query(F.data.startswith("adm_prod_delete:"))
-async def cb_prod_delete(c: CallbackQuery):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    _, cid_s, sid_s, pid_s = c.data.split(":")
-    cid, sid, pid = int(cid_s), int(sid_s), int(pid_s)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="вњ… Р”Р°, СѓРґР°Р»РёС‚СЊ", callback_data=f"adm_prod_delete_yes:{cid}:{sid}:{pid}")],
-        [InlineKeyboardButton(text="вќЊ РћС‚РјРµРЅР°", callback_data=f"adm_prod_manage:{cid}:{sid}:{pid}")],
-    ])
-    await safe_edit_text(c.message, "РЈРґР°Р»РёС‚СЊ С‚РѕРІР°СЂ?", reply_markup=kb)
+@router.callback_query(F.data.startswith("adm:prod_del:"))
+async def adm_prod_del(c: CallbackQuery):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_ADMIN):
+        return await c.answer("⛔ Нужно быть admin/owner", show_alert=True)
+
+    _, _, prod_id, sub_id, cat_id = c.data.split(":")
+    prod_id = int(prod_id); sub_id = int(sub_id); cat_id = int(cat_id)
+
+    conn = await db()
+    try:
+        await conn.execute("DELETE FROM products WHERE id=?", (prod_id,))
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    await safe_edit_text(c.message, "🗑️ Товар удалён.", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm:sub:{sub_id}:{cat_id}")]]
+    ))
     await c.answer()
 
 
-@router.callback_query(F.data.startswith("adm_prod_delete_yes:"))
-async def cb_prod_delete_yes(c: CallbackQuery):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
-        return
-    _, cid_s, sid_s, pid_s = c.data.split(":")
-    cid, sid, pid = int(cid_s), int(sid_s), int(pid_s)
-    await db_delete_product(pid)
-    await c.answer("РЈРґР°Р»РµРЅРѕ вњ…")
-    await cb_prod_list(c)
+@router.callback_query(F.data.startswith("adm:prod_edit_name:"))
+async def adm_prod_edit_name(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
 
-
-# ----- Edit product fields -----
-@router.callback_query(F.data.startswith("adm_edit_product:"))
-async def cb_edit_product(c: CallbackQuery, state: FSMContext):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќСѓР¶РЅРѕ Р±С‹С‚СЊ admin", show_alert=True)
-        return
-    pid = int(c.data.split(":")[1])
-    p = await db_get_product(pid)
-    if not p:
-        await c.answer("РўРѕРІР°СЂ РЅРµ РЅР°Р№РґРµРЅ", show_alert=True)
-        return
-    await state.set_state(EditProduct.product_id)
-    await state.update_data(product_id=pid)
-    await state.set_state(EditProduct.field)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="РќР°Р·РІР°РЅРёРµ", callback_data="ep_field:title")],
-        [InlineKeyboardButton(text="Р¦РµРЅР°", callback_data="ep_field:price")],
-        [InlineKeyboardButton(text="РћРїРёСЃР°РЅРёРµ", callback_data="ep_field:description")],
-        [InlineKeyboardButton(text="РњРµРґРёР° (С„РѕС‚Рѕ/РІРёРґРµРѕ/СѓР±СЂР°С‚СЊ)", callback_data="ep_field:media")],
-        [InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data=f"adm_prod_manage:0:0:{pid}")],
-    ])
-    await c.message.answer("Р§С‚Рѕ СЂРµРґР°РєС‚РёСЂСѓРµРј Сѓ С‚РѕРІР°СЂР°?", reply_markup=kb)
+    _, _, _, prod_id, sub_id, cat_id = c.data.split(":")
+    await state.update_data(product_id=int(prod_id), sub_id=int(sub_id), cat_id=int(cat_id), field="name")
+    await safe_edit_text(c.message, "Введите новое название товара:", reply_markup=kb_back(f"adm:prod:{prod_id}:{sub_id}:{cat_id}"))
+    await state.set_state(AdminEditProduct.value)
     await c.answer()
 
 
-@router.callback_query(EditProduct.field, F.data.startswith("ep_field:"))
-async def cb_ep_field(c: CallbackQuery, state: FSMContext):
-    field = c.data.split(":")[1]
-    await state.update_data(field=field)
-    await state.set_state(EditProduct.value)
+@router.callback_query(F.data.startswith("adm:prod_edit_desc:"))
+async def adm_prod_edit_desc(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
 
-    if field == "media":
-        await c.message.answer("РћС‚РїСЂР°РІСЊС‚Рµ С„РѕС‚Рѕ РёР»Рё РІРёРґРµРѕ РґР»СЏ С‚РѕРІР°СЂР°.\nРР»Рё РѕС‚РїСЂР°РІСЊС‚Рµ '-' С‡С‚РѕР±С‹ РЈР‘Р РђРўР¬ РјРµРґРёР°.")
-    else:
-        await c.message.answer(f"РћС‚РїСЂР°РІСЊС‚Рµ РЅРѕРІРѕРµ Р·РЅР°С‡РµРЅРёРµ РґР»СЏ РїРѕР»СЏ <b>{field}</b>.\n(РёР»Рё '-' С‡С‚РѕР±С‹ РѕС‡РёСЃС‚РёС‚СЊ)")
+    _, _, _, prod_id, sub_id, cat_id = c.data.split(":")
+    await state.update_data(product_id=int(prod_id), sub_id=int(sub_id), cat_id=int(cat_id), field="description")
+    await safe_edit_text(c.message, "Введите новое описание (или '-' чтобы очистить):", reply_markup=kb_back(f"adm:prod:{prod_id}:{sub_id}:{cat_id}"))
+    await state.set_state(AdminEditProduct.value)
     await c.answer()
 
 
-@router.message(EditProduct.value)
-async def st_ep_value(m: Message, state: FSMContext):
-    if not m.from_user or not await require_min_role(m.from_user.id, "admin"):
+@router.callback_query(F.data.startswith("adm:prod_edit_price:"))
+async def adm_prod_edit_price(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
+
+    _, _, _, prod_id, sub_id, cat_id = c.data.split(":")
+    await state.update_data(product_id=int(prod_id), sub_id=int(sub_id), cat_id=int(cat_id), field="price")
+    await safe_edit_text(c.message, "Введите новую цену (или '-' чтобы очистить):", reply_markup=kb_back(f"adm:prod:{prod_id}:{sub_id}:{cat_id}"))
+    await state.set_state(AdminEditProduct.value)
+    await c.answer()
+
+
+@router.message(AdminEditProduct.value)
+async def adm_prod_edit_save(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
         return
 
     data = await state.get_data()
-    pid = int(data["product_id"])
-    field = data["field"]
+    prod_id = int(data.get("product_id") or 0)
+    field = data.get("field")
+    sub_id = int(data.get("sub_id") or 0)
+    cat_id = int(data.get("cat_id") or 0)
 
-    if field == "media":
-        if m.text and m.text.strip() == "-":
-            await db_update_product_fields(pid, media_type="", media_file_id="")
-            await state.clear()
-            await m.answer("вњ… РњРµРґРёР° СѓР±СЂР°РЅРѕ. /admin")
-            return
-        if m.photo:
-            await db_update_product_fields(pid, media_type="photo", media_file_id=m.photo[-1].file_id)
-            await state.clear()
-            await m.answer("вњ… Р¤РѕС‚Рѕ РѕР±РЅРѕРІР»РµРЅРѕ. /admin")
-            return
-        if m.video:
-            await db_update_product_fields(pid, media_type="video", media_file_id=m.video.file_id)
-            await state.clear()
-            await m.answer("вњ… Р’РёРґРµРѕ РѕР±РЅРѕРІР»РµРЅРѕ. /admin")
-            return
-        await m.answer("РќСѓР¶РЅРѕ С„РѕС‚Рѕ/РІРёРґРµРѕ РёР»Рё '-' С‡С‚РѕР±С‹ СѓР±СЂР°С‚СЊ. РџРѕРїСЂРѕР±СѓР№С‚Рµ РµС‰С‘ СЂР°Р·:")
-        return
-
-    txt = (m.text or "").strip()
-    if not txt:
-        await m.answer("РџСѓСЃС‚Рѕ. Р’РІРµРґРёС‚Рµ РµС‰С‘ СЂР°Р·:")
-        return
-    if txt == "-":
-        txt = ""
-
-    if field not in ("title", "price", "description"):
-        await m.answer("РќРµРёР·РІРµСЃС‚РЅРѕРµ РїРѕР»Рµ.")
+    if not prod_id or field not in ("name", "description", "price"):
         await state.clear()
-        return
+        return await m.answer("Ошибка состояния.")
 
-    await db_update_product_fields(pid, **{field: txt})
+    val = (m.text or "").strip()
+    if val == "-":
+        val = ""
+
+    conn = await db()
+    try:
+        await conn.execute(f"UPDATE products SET {field}=? WHERE id=?", (val, prod_id))
+        await conn.commit()
+    finally:
+        await conn.close()
+
     await state.clear()
-    await m.answer("вњ… РћР±РЅРѕРІР»РµРЅРѕ. /admin")
+    await m.answer("✅ Обновлено. /admin")
 
 
-# =========================
-# SET BUY METHOD (admin+)
-# =========================
-@router.callback_query(F.data.startswith("adm_setbuy:"))
-async def cb_setbuy_start(c: CallbackQuery, state: FSMContext):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќСѓР¶РЅРѕ Р±С‹С‚СЊ admin", show_alert=True)
-        return
-    pid = int(c.data.split(":")[1])
-    p = await db_get_product(pid)
-    if not p:
-        await c.answer("РўРѕРІР°СЂ РЅРµ РЅР°Р№РґРµРЅ", show_alert=True)
-        return
+@router.callback_query(F.data.startswith("adm:prod_edit_media:"))
+async def adm_prod_edit_media(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
 
-    await state.set_state(SetBuy.product_id)
-    await state.update_data(product_id=pid)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="рџ”— РЎСЃС‹Р»РєР° (URL)", callback_data="setbuy_type:link")],
-        [InlineKeyboardButton(text="рџ‘¤ РњРµРЅРµРґР¶РµСЂ (@username)", callback_data="setbuy_type:manager")],
-        [InlineKeyboardButton(text="рџ“ќ РўРµРєСЃС‚/РёРЅСЃС‚СЂСѓРєС†РёСЏ", callback_data="setbuy_type:text")],
-    ])
-    await c.message.answer("Р’С‹Р±РµСЂРёС‚Рµ СЃРїРѕСЃРѕР± РїРѕРєСѓРїРєРё:", reply_markup=kb)
+    _, _, _, prod_id, sub_id, cat_id = c.data.split(":")
+    await state.update_data(product_id=int(prod_id), sub_id=int(sub_id), cat_id=int(cat_id))
+    await safe_edit_text(c.message, "Пришлите новое фото/видео (или '-' чтобы удалить медиа):", reply_markup=kb_back(f"adm:prod:{prod_id}:{sub_id}:{cat_id}"))
+    await state.set_state(AdminEditProduct.media)
     await c.answer()
 
 
-@router.callback_query(SetBuy.product_id, F.data.startswith("setbuy_type:"))
-async def cb_setbuy_type(c: CallbackQuery, state: FSMContext):
-    ptype = c.data.split(":")[1]
-    await state.update_data(purchase_type=ptype)
-    await state.set_state(SetBuy.purchase_payload)
-
-    if ptype == "link":
-        await c.message.answer("РћС‚РїСЂР°РІСЊС‚Рµ СЃСЃС‹Р»РєСѓ (URL):")
-    elif ptype == "manager":
-        await c.message.answer("РћС‚РїСЂР°РІСЊС‚Рµ username РјРµРЅРµРґР¶РµСЂР° (@manager РёР»Рё manager):")
-    else:
-        await c.message.answer("РћС‚РїСЂР°РІСЊС‚Рµ С‚РµРєСЃС‚ РёРЅСЃС‚СЂСѓРєС†РёРё:")
-    await c.answer()
-
-
-@router.message(SetBuy.purchase_payload)
-async def st_setbuy_payload(m: Message, state: FSMContext):
-    txt = (m.text or "").strip()
-    if not txt:
-        await m.answer("РџСѓСЃС‚Рѕ. Р’РІРµРґРёС‚Рµ РµС‰С‘ СЂР°Р·:")
+@router.message(AdminEditProduct.media)
+async def adm_prod_edit_media_save(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
         return
-
     data = await state.get_data()
-    ptype = data["purchase_type"]
+    prod_id = int(data.get("product_id") or 0)
+    if not prod_id:
+        await state.clear()
+        return await m.answer("Ошибка состояния.")
 
-    if ptype == "link":
-        payload = {"url": txt}
-    elif ptype == "manager":
-        username = txt[1:] if txt.startswith("@") else txt
-        payload = {"username": username, "template": "Р—РґСЂР°РІСЃС‚РІСѓР№С‚Рµ! РҐРѕС‡Сѓ РєСѓРїРёС‚СЊ С‚РѕРІР°СЂ (id={product_id})."}
+    media_type = ""
+    media_file_id = ""
+    if (m.text or "").strip() == "-":
+        pass
+    elif m.photo:
+        media_type = "photo"
+        media_file_id = m.photo[-1].file_id
+    elif m.video:
+        media_type = "video"
+        media_file_id = m.video.file_id
     else:
-        payload = {"text": txt}
+        return await m.answer("Пришлите фото/видео или '-'.")
 
-    await state.update_data(purchase_payload=payload)
-    await state.set_state(SetBuy.purchase_button_text)
-    await m.answer("РўРµРєСЃС‚ РєРЅРѕРїРєРё? РР»Рё '-' РґР»СЏ 'РљСѓРїРёС‚СЊ':")
+    conn = await db()
+    try:
+        await conn.execute(
+            "UPDATE products SET media_type=?, media_file_id=? WHERE id=?",
+            (media_type, media_file_id, prod_id)
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
 
-
-@router.message(SetBuy.purchase_button_text)
-async def st_setbuy_btn(m: Message, state: FSMContext):
-    btn = (m.text or "").strip()
-    if btn == "-" or not btn:
-        btn = "РљСѓРїРёС‚СЊ"
-
-    data = await state.get_data()
-    pid = int(data["product_id"])
-    ptype = data["purchase_type"]
-    payload = data["purchase_payload"]
-
-    await db_upsert_purchase_method(pid, ptype, payload, btn)
     await state.clear()
-    await m.answer("вњ… РЎРїРѕСЃРѕР± РїРѕРєСѓРїРєРё РѕР±РЅРѕРІР»С‘РЅ. /admin")
+    await m.answer("✅ Медиа обновлено. /admin")
 
 
-# =========================
-# EDIT TEXTS (РїСЂРёРІРµС‚СЃС‚РІРёРµ / support / start)
-# =========================
-@router.callback_query(F.data == "adm_texts")
-async def cb_texts(c: CallbackQuery, state: FSMContext):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќСѓР¶РЅРѕ Р±С‹С‚СЊ admin", show_alert=True)
-        return
+# -------------------- ADMIN: BUY METHODS --------------------
+@router.callback_query(F.data.startswith("adm:buy:"))
+async def adm_buy_list(c: CallbackQuery):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="РўРµРєСЃС‚ /start", callback_data="txt:start_text")],
-        [InlineKeyboardButton(text="РўРµС…РїРѕРґРґРµСЂР¶РєР°", callback_data="txt:support_text")],
-        [InlineKeyboardButton(text="РџСЂРёРІРµС‚СЃС‚РІРёРµ РІ РіСЂСѓРїРїРµ", callback_data="txt:group_welcome_text")],
-        [InlineKeyboardButton(text="РљРЅРѕРїРєР° РїСЂРёРІРµС‚СЃС‚РІРёСЏ", callback_data="txt:group_welcome_button")],
-        [InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data="adm_back_admin")],
-    ])
-    await safe_edit_text(c.message, "рџ“ќ Р§С‚Рѕ СЂРµРґР°РєС‚РёСЂСѓРµРј?", reply_markup=kb)
+    _, _, prod_id, sub_id, cat_id = c.data.split(":")
+    prod_id = int(prod_id); sub_id = int(sub_id); cat_id = int(cat_id)
+
+    methods = await list_buy_methods(prod_id)
+    rows = []
+    for mth in methods:
+        rows.append([InlineKeyboardButton(text=f"✏️ {mth['title']}", callback_data=f"adm:buy_edit:{mth['id']}:{prod_id}:{sub_id}:{cat_id}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить способ", callback_data=f"adm:buy_add:{prod_id}:{sub_id}:{cat_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm:prod:{prod_id}:{sub_id}:{cat_id}")])
+
+    await safe_edit_text(c.message, "🧾 Способы покупки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await c.answer()
 
 
-@router.callback_query(F.data.startswith("txt:"))
-async def cb_txt_pick(c: CallbackQuery, state: FSMContext):
-    if not await require_min_role(c.from_user.id, "admin"):
-        await c.answer("РќРµС‚ РґРѕСЃС‚СѓРїР°", show_alert=True)
+@router.callback_query(F.data.startswith("adm:buy_add:"))
+async def adm_buy_add(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
+
+    _, _, prod_id, sub_id, cat_id = c.data.split(":")
+    await state.update_data(product_id=int(prod_id), sub_id=int(sub_id), cat_id=int(cat_id))
+    await safe_edit_text(c.message, "Введите название кнопки (например: 'Оплатить картой'):", reply_markup=kb_back(f"adm:buy:{prod_id}:{sub_id}:{cat_id}"))
+    await state.set_state(AdminAddBuyMethod.title)
+    await c.answer()
+
+
+@router.message(AdminAddBuyMethod.title)
+async def adm_buy_add_title(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
         return
-    key = c.data.split(":")[1]
-    current = await db_get_setting(key)
+    title = (m.text or "").strip()
+    if not title:
+        return await m.answer("Введите название.")
+    await state.update_data(title=title)
+    await m.answer("Теперь отправьте ссылку (URL):")
+    await state.set_state(AdminAddBuyMethod.url)
 
-    await state.set_state(EditTexts.key)
-    await state.update_data(key=key)
-    await state.set_state(EditTexts.value)
 
-    await c.message.answer(
-        f"РўРµРєСѓС‰РёР№ С‚РµРєСЃС‚ РґР»СЏ <b>{key}</b>:\n\n<code>{current}</code>\n\n"
-        f"РћС‚РїСЂР°РІСЊС‚Рµ РЅРѕРІС‹Р№ С‚РµРєСЃС‚ (РёР»Рё '-' С‡С‚РѕР±С‹ РѕС‡РёСЃС‚РёС‚СЊ):"
+@router.message(AdminAddBuyMethod.url)
+async def adm_buy_add_url(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return
+    data = await state.get_data()
+    prod_id = int(data.get("product_id") or 0)
+    title = data.get("title", "")
+    url = (m.text or "").strip()
+    if not (prod_id and title and url.startswith(("http://", "https://", "tg://"))):
+        return await m.answer("Нужна ссылка, начинающаяся с http:// или https:// (или tg://).")
+
+    conn = await db()
+    try:
+        await conn.execute(
+            "INSERT INTO buy_methods(product_id, title, url, pos) VALUES(?,?,?,0)",
+            (prod_id, title, url)
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    await state.clear()
+    await m.answer("✅ Способ покупки добавлен. /admin")
+
+
+@router.callback_query(F.data.startswith("adm:buy_edit:"))
+async def adm_buy_edit(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
+        return await c.answer("⛔ Нет доступа", show_alert=True)
+
+    _, _, mid, prod_id, sub_id, cat_id = c.data.split(":")
+    mid = int(mid)
+
+    conn = await db()
+    try:
+        cur = await conn.execute("SELECT id, title, url FROM buy_methods WHERE id=?", (mid,))
+        row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    if not row:
+        return await c.answer("Не найдено", show_alert=True)
+
+    await state.update_data(method_id=mid, prod_id=int(prod_id), sub_id=int(sub_id), cat_id=int(cat_id))
+    await safe_edit_text(
+        c.message,
+        f"Текущий способ:\n<b>{row['title']}</b>\n{row['url']}\n\n"
+        "Отправьте новое название (или '-' чтобы оставить):",
+        reply_markup=kb_back(f"adm:buy:{prod_id}:{sub_id}:{cat_id}")
     )
+    await state.set_state(AdminEditBuyMethod.title)
     await c.answer()
 
 
-@router.message(EditTexts.value)
-async def st_txt_value(m: Message, state: FSMContext):
-    if not m.from_user or not await require_min_role(m.from_user.id, "admin"):
+@router.message(AdminEditBuyMethod.title)
+async def adm_buy_edit_title(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
         return
-    txt = (m.text or "").strip()
-    if not txt:
-        await m.answer("РџСѓСЃС‚Рѕ. Р’РІРµРґРёС‚Рµ РµС‰С‘ СЂР°Р·:")
-        return
-    if txt == "-":
-        txt = ""
 
     data = await state.get_data()
-    key = data["key"]
-    await db_set_setting(key, txt)
-    await state.clear()
-    await m.answer("вњ… РўРµРєСЃС‚ РѕР±РЅРѕРІР»С‘РЅ. /admin")
+    mid = int(data.get("method_id") or 0)
+    if not mid:
+        await state.clear()
+        return await m.answer("Ошибка состояния.")
+
+    title = (m.text or "").strip()
+    if title != "-":
+        conn = await db()
+        try:
+            await conn.execute("UPDATE buy_methods SET title=? WHERE id=?", (title, mid))
+            await conn.commit()
+        finally:
+            await conn.close()
+
+    await m.answer("Теперь отправьте новый URL (или '-' чтобы оставить):")
+    await state.set_state(AdminEditBuyMethod.url)
 
 
-# =========================
-# OWNER: roles
-# =========================
-@router.callback_query(F.data == "adm_roles")
-async def cb_roles(c: CallbackQuery, state: FSMContext):
-    if not await require_min_role(c.from_user.id, "owner"):
-        await c.answer("РўРѕР»СЊРєРѕ OWNER", show_alert=True)
+@router.message(AdminEditBuyMethod.url)
+async def adm_buy_edit_url(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_MOD):
         return
 
-    staff = await db_list_staff()
-    text = "<b>рџ‘‘ Р РѕР»Рё</b>\n\n"
-    for uid, role in staff:
-        text += f"- <code>{uid}</code> вЂ” <b>{role}</b>\n"
-    text += "\nР’С‹Р±РµСЂРёС‚Рµ РґРµР№СЃС‚РІРёРµ:"
+    data = await state.get_data()
+    mid = int(data.get("method_id") or 0)
+    url = (m.text or "").strip()
+
+    if url != "-":
+        if not url.startswith(("http://", "https://", "tg://")):
+            return await m.answer("Нужна ссылка http:// или https:// (или tg://).")
+        conn = await db()
+        try:
+            await conn.execute("UPDATE buy_methods SET url=? WHERE id=?", (url, mid))
+            await conn.commit()
+        finally:
+            await conn.close()
+
+    await state.clear()
+    await m.answer("✅ Способ покупки обновлён. /admin")
+
+
+# -------------------- ADMIN: STAFF (OWNER/ADMIN can) --------------------
+@router.callback_query(F.data == "adm:staff")
+async def adm_staff(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_ADMIN):
+        return await c.answer("⛔ Нужно быть admin/owner", show_alert=True)
+
+    rows = await staff_list()
+    text = "👥 <b>Сотрудники</b>:\n\n"
+    if not rows:
+        text += "Пока никого нет."
+    else:
+        for r in rows:
+            text += f"• <code>{r['user_id']}</code> — <b>{r['role']}</b>\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="вћ• РќР°Р·РЅР°С‡РёС‚СЊ (admin/mod)", callback_data="role_action:set")],
-        [InlineKeyboardButton(text="вћ– РЎРЅСЏС‚СЊ СЂРѕР»СЊ (РІ user)", callback_data="role_action:unset")],
-        [InlineKeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ", callback_data="adm_back_admin")],
+        [InlineKeyboardButton(text="➕ Добавить", callback_data="staff:add")],
+        [InlineKeyboardButton(text="➖ Удалить", callback_data="staff:remove")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:home")],
     ])
     await safe_edit_text(c.message, text, reply_markup=kb)
     await c.answer()
 
 
-@router.callback_query(F.data.startswith("role_action:"))
-async def cb_role_action(c: CallbackQuery, state: FSMContext):
-    if not await require_min_role(c.from_user.id, "owner"):
-        await c.answer("РўРѕР»СЊРєРѕ OWNER", show_alert=True)
-        return
-    action = c.data.split(":")[1]  # set/unset
-    await state.set_state(RolesManage.action)
-    await state.update_data(action=action)
-    await state.set_state(RolesManage.user_id)
-    await c.message.answer("Р’РІРµРґРёС‚Рµ user_id РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ (С†РёС„СЂС‹):")
-    await c.answer()
-
-
-@router.message(RolesManage.user_id)
-async def st_role_user_id(m: Message, state: FSMContext):
-    if not m.from_user or not await require_min_role(m.from_user.id, "owner"):
-        return
-    txt = (m.text or "").strip()
-    if not txt.isdigit():
-        await m.answer("РќСѓР¶РЅРѕ С‡РёСЃР»Рѕ user_id. Р’РІРµРґРёС‚Рµ СЃРЅРѕРІР°:")
-        return
-
-    uid = int(txt)
-    data = await state.get_data()
-    action = data.get("action")
-
-    if uid == OWNER_ID and action != "set":
-        await m.answer("РќРµР»СЊР·СЏ СЃРЅСЏС‚СЊ СЂРѕР»СЊ СЃ OWNER_ID.")
-        return
-
-    if action == "unset":
-        await db_set_role(uid, "user")
-        await state.clear()
-        await m.answer(f"вњ… РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ <code>{uid}</code> С‚РµРїРµСЂСЊ <b>user</b>.")
-        return
-
-    await state.update_data(target_user_id=uid)
-    await state.set_state(RolesManage.role)
+@router.callback_query(F.data == "staff:add")
+async def staff_add_start(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_ADMIN):
+        return await c.answer("⛔ Нужно быть admin/owner", show_alert=True)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="admin", callback_data="setrole:admin")],
-        [InlineKeyboardButton(text="mod", callback_data="setrole:mod")],
-        [InlineKeyboardButton(text="в¬…пёЏ РћС‚РјРµРЅР°", callback_data="adm_back_admin")]
+        [InlineKeyboardButton(text="admin", callback_data="staff:role:admin")],
+        [InlineKeyboardButton(text="mod", callback_data="staff:role:mod")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:staff")],
     ])
-    await m.answer("Р’С‹Р±РµСЂРёС‚Рµ СЂРѕР»СЊ:", reply_markup=kb)
-
-
-@router.callback_query(RolesManage.role, F.data.startswith("setrole:"))
-async def cb_set_role(c: CallbackQuery, state: FSMContext):
-    if not await require_min_role(c.from_user.id, "owner"):
-        await c.answer("РўРѕР»СЊРєРѕ OWNER", show_alert=True)
-        return
-
-    role = c.data.split(":")[1]
-    data = await state.get_data()
-    uid = int(data["target_user_id"])
-
-    if uid == OWNER_ID:
-        await c.answer("OWNER_ID РІСЃРµРіРґР° owner", show_alert=True)
-        return
-
-    await db_set_role(uid, role)
-    await state.clear()
-    await c.message.answer(f"вњ… РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ <code>{uid}</code> С‚РµРїРµСЂСЊ <b>{role}</b>.")
+    await safe_edit_text(c.message, "Выберите роль:", reply_markup=kb)
+    await state.set_state(StaffAdd.role)
     await c.answer()
 
 
-# =========================
-# RUN
-# =========================
+@router.callback_query(F.data.startswith("staff:role:"))
+async def staff_add_role(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_ADMIN):
+        return await c.answer("⛔ Нужно быть admin/owner", show_alert=True)
+
+    new_role = c.data.split(":")[-1]
+    await state.update_data(new_role=new_role)
+    await safe_edit_text(c.message, "Отправьте user_id человека (число).", reply_markup=kb_back("adm:staff"))
+    await state.set_state(StaffAdd.user_id)
+    await c.answer()
+
+
+@router.message(StaffAdd.user_id)
+async def staff_add_finish(m: Message, state: FSMContext):
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_ADMIN):
+        return
+
+    data = await state.get_data()
+    new_role = data.get("new_role")
+    try:
+        uid = int((m.text or "").strip())
+    except Exception:
+        return await m.answer("Нужен user_id числом.")
+
+    if OWNER_ID and uid == OWNER_ID:
+        await state.clear()
+        return await m.answer("Это владелец — роль owner уже установлена.")
+
+    if new_role not in (ROLE_ADMIN, ROLE_MOD):
+        await state.clear()
+        return await m.answer("Ошибка роли.")
+
+    await staff_set_role(uid, new_role)
+    await state.clear()
+    await m.answer(f"✅ Добавлено: {uid} → {new_role}. /admin")
+
+
+@router.callback_query(F.data == "staff:remove")
+async def staff_remove_start(c: CallbackQuery, state: FSMContext):
+    role = await get_staff_role(c.from_user.id)
+    if not role_at_least(role, ROLE_ADMIN):
+        return await c.answer("⛔ Нужно быть admin/owner", show_alert=True)
+    await safe_edit_text(c.message, "Отправьте user_id, которого удалить из staff:", reply_markup=kb_back("adm:staff"))
+    await state.set_state(StaffAdd.user_id)
+    await state.update_data(remove_mode=True)
+    await c.answer()
+
+
+@router.message(StaffAdd.user_id)
+async def staff_remove_finish(m: Message, state: FSMContext):
+    # этот хендлер уже используется выше; различим режим по remove_mode
+    data = await state.get_data()
+    if not data.get("remove_mode"):
+        return  # пусть отработает add_finish выше
+
+    role = await get_staff_role(m.from_user.id)
+    if not role_at_least(role, ROLE_ADMIN):
+        return
+
+    try:
+        uid = int((m.text or "").strip())
+    except Exception:
+        await state.clear()
+        return await m.answer("Нужен user_id числом.")
+
+    if OWNER_ID and uid == OWNER_ID:
+        await state.clear()
+        return await m.answer("Нельзя удалить владельца.")
+
+    await staff_remove(uid)
+    await state.clear()
+    await m.answer(f"✅ Удалено: {uid}. /admin")
+
+
+# -------------------- MAIN --------------------
 async def main():
-    global BOT_USERNAME
-    await db_init()
+    await init_db()
     me = await bot.get_me()
-    BOT_USERNAME = me.username
-    logger.info(f"Bot started as @{BOT_USERNAME}")
+    log.info("Bot started as @%s", me.username)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
